@@ -9,25 +9,26 @@
 //! 与我们给维基百科历史快照做的是同一个判断：**别取现在，取变化**。区别是
 //! GitHub 直接把变化给了你，不用像维基那样从修订列表里采样。
 //!
-//! ## 评论走仓库级，事件走逐个——这不是不一致，是两个端点能力不同
+//! ## 工单列表增量筛选，评论与事件逐工单读取
 //!
 //! 第一版想让三样都走仓库级端点、一次分页取全，避免 200 张工单 401 次请求
 //! （未认证时 GitHub 每小时只给 60 次）。**拿真实数据一跑就发现事件那一路是错的**：
 //!
-//! - `issues/comments` 支持 `since`，增量窗口内的评论一次取全。**好用**。
+//! - `issues/comments` 支持 `since`，但只给改动过的评论。文档是整篇替换，
+//!   因而只改标题也会把所有旧评论从当前文档删掉；新增评论则只留下新增的部分。
 //! - `issues/events` **不支持 `since`**，只能从最新往回翻。而 GitHub 的模型里
 //!   PR 也产生 issue 事件——实测本仓库工单事件埋在第 5 页，换一个 PR 活跃的仓库
 //!   就会被推到翻页上限之外。**于是"状态变更史"悄悄变成空的，而它正是这个来源
 //!   存在的理由。**
 //!
-//! 所以事件改成逐工单取 `GET /repos/{repo}/issues/{n}/events`。N+1 的代价是真的，
-//! 但 N 只是**本轮要写入的工单数**：首次同步等于工单总数，之后有 `since` 兜着，
-//! 通常是个位数。用一次准确换一次省事，这里该换。
+//! 所以评论与事件都逐工单取，不带 `since`。只对筛选后本轮要写入的工单请求，
+//! 避免全仓库的无关评论消耗分页预算。请求数增加的代价是真的，但 N 只是
+//! **本轮要写入的工单数**：之后有工单列表的 `since` 兜着，通常是个位数。
 //!
 //! 三次拉取因此是：
 //!
 //! - `GET /repos/{repo}/issues?state=all&since=` —— 工单本体（分页）
-//! - `GET /repos/{repo}/issues/comments?since=`  —— 全仓库评论（分页），按号归拢
+//! - `GET /repos/{repo}/issues/{n}/comments`    —— 每张工单的评论（分页）
 //! - `GET /repos/{repo}/issues/{n}/events`       —— 每张工单一次
 //!
 //! ## 关于 PR
@@ -36,12 +37,12 @@
 //! `pull_request` 字段区分。默认排除：问"工单系统"要的是工单。但留了开关——
 //! 有些仓库（包括本仓库）的决策记录实际写在 PR 描述里。
 
+use crate::time_text;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use std::collections::HashMap;
 
 /// 一次同步最多取多少页（每页 100）。GitHub 的分页没有天然终点，
-/// 一个活跃仓库能翻很久；这里封顶，超出的等下一次 `since` 增量取。
+/// 一个活跃仓库能翻很久；这里沿用单端点的分页预算。
 const MAX_PAGES: u32 = 10;
 const PER_PAGE: u32 = 100;
 
@@ -100,6 +101,11 @@ fn issue_number_from_url(url: &str) -> Option<i64> {
     url.rsplit('/').next()?.parse().ok()
 }
 
+/// 工单上的一个时刻，写进正文的样子：到秒、带 `Z`（`2026-08-18T16:18:27Z`）
+fn stamp(t: DateTime<Utc>) -> String {
+    time_text::world(t, Some("second"))
+}
+
 /// 把一张工单连同它的评论与事件排成一篇文档。
 ///
 /// **纯函数，不联网**——取回与组织分开，于是组织这一半测得动。
@@ -109,18 +115,22 @@ pub fn render(issue: &Issue, comments: &[&Comment], events: &[&Event]) -> String
     out.push_str(&format!("# #{} {}\n\n", issue.number, issue.title));
 
     // 抬头写成带日期的陈述句，而不是键值对：抽取器读的是句子。
-    // "opened by X on 2026-08-18" 能抽出带 valid_from 的事实，
-    // "created_at: 2026-08-18" 则要它自己去猜这是什么意思
+    // "opened by X on 2026-08-18T16:18:27Z" 能抽出带 valid_from 的事实，
+    // "created_at: 2026-08-18" 则要它自己去猜这是什么意思。
+    //
+    // **时间写到秒**（#691，0024 第 3 节）：GitHub 给的是带 `Z` 的时刻，抽取器读回来就是
+    // second 精度。从前截到 UTC 的那一天，起点最多提前 24 小时，同一天的两件事还会被判成
+    // 同时发生的冲突。这不是开关——精度是数据自己的，截掉它等于替来源说「不知道几点」
     if let Some(u) = &issue.user {
         out.push_str(&format!(
             "Opened by {} on {}.\n",
             u.login,
-            issue.created_at.format("%Y-%m-%d")
+            stamp(issue.created_at)
         ));
     }
     out.push_str(&format!("Currently {}.\n", issue.state));
     if let Some(c) = issue.closed_at {
-        out.push_str(&format!("Closed on {}.\n", c.format("%Y-%m-%d")));
+        out.push_str(&format!("Closed on {}.\n", stamp(c)));
     }
     if !issue.labels.is_empty() {
         let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
@@ -155,7 +165,7 @@ pub fn render(issue: &Issue, comments: &[&Comment], events: &[&Event]) -> String
             };
             out.push_str(&format!(
                 "- {} — {} by {}{}\n",
-                e.created_at.format("%Y-%m-%d"),
+                stamp(e.created_at),
                 e.event,
                 who,
                 detail
@@ -174,7 +184,7 @@ pub fn render(issue: &Issue, comments: &[&Comment], events: &[&Event]) -> String
             out.push_str(&format!(
                 "### {} on {}\n\n{}\n\n",
                 who,
-                c.created_at.format("%Y-%m-%d"),
+                stamp(c.created_at),
                 body
             ));
         }
@@ -182,28 +192,14 @@ pub fn render(issue: &Issue, comments: &[&Comment], events: &[&Event]) -> String
     out
 }
 
-/// 把全仓库的评论按工单号归拢，各自按时间升序。
-///
-/// 评论是**全仓库**取回来的，里面混着不在本次工单集合里的（增量窗口不同步）。
-/// 归不到工单上的直接丢——它们下次会跟着自己的工单一起回来。
-pub fn group_comments<'a>(
-    issues: &'a [Issue],
-    comments: &'a [Comment],
-) -> Vec<(&'a Issue, Vec<&'a Comment>)> {
-    let mut by_issue: HashMap<i64, Vec<&Comment>> = HashMap::new();
-    for c in comments {
-        if let Some(n) = issue_number_from_url(&c.issue_url) {
-            by_issue.entry(n).or_default().push(c);
-        }
-    }
-    issues
+/// 只保留这张工单的评论，按时间升序；响应里归不到它的评论不能混进正文。
+pub fn comments_for_issue<'a>(issue: &Issue, comments: &'a [Comment]) -> Vec<&'a Comment> {
+    let mut comments: Vec<_> = comments
         .iter()
-        .map(|issue| {
-            let mut cs = by_issue.remove(&issue.number).unwrap_or_default();
-            cs.sort_by_key(|c| c.created_at);
-            (issue, cs)
-        })
-        .collect()
+        .filter(|comment| issue_number_from_url(&comment.issue_url) == Some(issue.number))
+        .collect();
+    comments.sort_by_key(|comment| comment.created_at);
+    comments
 }
 
 /// 事件按时间升序。逐工单端点返回的**看起来**是升序，但顺序不是契约，
@@ -211,6 +207,41 @@ pub fn group_comments<'a>(
 pub fn sort_events(mut events: Vec<Event>) -> Vec<Event> {
     events.sort_by_key(|e| e.created_at);
     events
+}
+
+/// 发一个带令牌的 GET 并判状态。github_issues 与 github_repo 共用这一条，
+/// 免得限流提示在两个来源里各写一份、慢慢漂移。
+pub(crate) async fn get_checked(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+    auth: Option<&str>,
+    accept: Option<&str>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut req = http.get(url);
+    if let Some(a) = auth {
+        req = req.header(reqwest::header::AUTHORIZATION, a);
+    }
+    if let Some(a) = accept {
+        req = req.header(reqwest::header::ACCEPT, a);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        // 限流说清楚是限流：未认证时每小时 60 次，一个中等仓库一次同步就能吃光。
+        // 报成通用 HTTP 错会让人去查网络，而正确的动作是配一个令牌
+        let remaining = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?");
+        if status == reqwest::StatusCode::FORBIDDEN && remaining == "0" {
+            anyhow::bail!(
+                "GitHub 限流：本小时配额已用尽。未认证时每小时 60 次，配一个令牌可提到 5000"
+            );
+        }
+        anyhow::bail!("HTTP {status} from GitHub");
+    }
+    Ok(resp)
 }
 
 /// 分页取一个端点，直到空页或触顶。
@@ -233,27 +264,7 @@ pub async fn fetch_all<T: for<'de> Deserialize<'de>>(
             q.append_pair("per_page", &PER_PAGE.to_string());
             q.append_pair("page", &page.to_string());
         }
-        let mut req = http.get(url);
-        if let Some(a) = auth {
-            req = req.header(reqwest::header::AUTHORIZATION, a);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            // 限流说清楚是限流：未认证时每小时 60 次，一个中等仓库一次同步就能吃光。
-            // 报成通用 HTTP 错会让人去查网络，而正确的动作是配一个令牌
-            let remaining = resp
-                .headers()
-                .get("x-ratelimit-remaining")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("?");
-            if status == reqwest::StatusCode::FORBIDDEN && remaining == "0" {
-                anyhow::bail!(
-                    "GitHub 限流：本小时配额已用尽。未认证时每小时 60 次，配一个令牌可提到 5000"
-                );
-            }
-            anyhow::bail!("HTTP {status} from GitHub");
-        }
+        let resp = get_checked(http, url, auth, None).await?;
         let batch: Vec<T> = resp.json().await?;
         let n = batch.len();
         out.extend(batch);
@@ -307,26 +318,52 @@ mod tests {
         .unwrap();
         let out = render(&i, &[], &[&e1, &e2]);
 
-        assert!(out.contains("Opened by Danmushu on 2026-08-18."), "{out}");
-        assert!(out.contains("Closed on 2026-08-20."), "{out}");
+        assert!(
+            out.contains("Opened by Danmushu on 2026-08-18T16:18:27Z."),
+            "{out}"
+        );
+        assert!(out.contains("Closed on 2026-08-20T22:31:47Z."), "{out}");
         assert!(out.contains("Labelled bug."), "{out}");
         assert!(out.contains("Assigned to WaylandYang."), "{out}");
         // 事件行带日期与执行者，labeled 还要带上是哪个标签
         assert!(
-            out.contains("- 2026-08-19 — labeled by WaylandYang (bug)"),
+            out.contains("- 2026-08-19T01:00:00Z — labeled by WaylandYang (bug)"),
             "{out}"
         );
         assert!(
-            out.contains("- 2026-08-20 — closed by WaylandYang"),
+            out.contains("- 2026-08-20T22:31:47Z — closed by WaylandYang"),
             "{out}"
         );
     }
 
-    /// 评论是**全仓库**取的，归拢必须按工单号，且按时间升序。
+    /// 正文里的时刻抽取器读得回来，而且是 second 精度：一件 UTC 23:59:59 发生的事，
+    /// 起点就是那一秒，不是那天的零点（#691）
+    #[test]
+    fn a_time_in_the_document_reads_back_to_the_second() {
+        let i = issue(serde_json::json!({
+            "number": 18, "title": "Anything", "state": "open",
+            "created_at": "2026-09-05T23:59:59Z", "updated_at": "2026-09-05T23:59:59Z",
+            "user": {"login": "x"}
+        }));
+        let c: Comment = serde_json::from_value(serde_json::json!({
+            "issue_url": "https://api.github.com/repos/x/y/issues/18",
+            "user": {"login": "x"}, "created_at": "2026-09-05T23:59:59Z", "body": "late"
+        }))
+        .unwrap();
+        let out = render(&i, &[&c], &[]);
+        let written = "2026-09-05T23:59:59Z";
+        assert!(out.contains(&format!("Opened by x on {written}.")), "{out}");
+        assert!(out.contains(&format!("### x on {written}")), "{out}");
+        let (at, precision) = utopia_extract::parse_time(written).expect("reads back");
+        assert_eq!(precision, "second");
+        assert_eq!(at, i.created_at);
+    }
+
+    /// 评论仍按工单号验证，且按时间升序。
     /// 归错了的后果很隐蔽：另一张工单的讨论出现在这张的正文里。
     #[test]
-    fn repo_wide_comments_land_on_the_right_issue() {
-        let issues = vec![
+    fn comments_belong_to_the_issue_and_are_chronological() {
+        let issues = [
             issue(serde_json::json!({
                 "number": 1, "title": "one", "state": "open", "body": null,
                 "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-02T00:00:00Z",
@@ -345,19 +382,16 @@ mod tests {
              "user": {"login": "y"}, "created_at": "2026-01-03T00:00:00Z", "body": "第一条"},
             // 不在本次工单集合里：该被丢掉，而不是挂到别人身上
             {"issue_url": "https://api.github.com/repos/a/b/issues/99",
-             "user": {"login": "z"}, "created_at": "2026-01-04T00:00:00Z", "body": "别人的"}
+             "user": {"login": "z"}, "created_at": "2026-01-04T00:00:00Z", "body": "别人的"},
+            {"issue_url": "nonsense",
+             "user": null, "created_at": "2026-01-02T00:00:00Z", "body": "无法归属"}
         ]))
         .unwrap();
-        let grouped = group_comments(&issues, &comments);
-        assert_eq!(grouped.len(), 2);
-
-        let (one, one_comments) = &grouped[0];
-        assert_eq!(one.number, 1);
+        let one_comments = comments_for_issue(&issues[0], &comments);
         assert!(one_comments.is_empty(), "1 号没有评论");
 
-        let (two, two_comments) = &grouped[1];
-        assert_eq!(two.number, 2);
-        assert_eq!(two_comments.len(), 2, "99 号那条不该混进来");
+        let two_comments = comments_for_issue(&issues[1], &comments);
+        assert_eq!(two_comments.len(), 2, "其他工单和无法归属的评论不该混进来");
         // 升序：先"第一条"（01-03）后"第二条"（01-05）
         assert_eq!(two_comments[0].body.as_deref(), Some("第一条"));
     }
@@ -423,11 +457,9 @@ mod tests {
             "夹具应当只含真工单"
         );
 
-        let grouped = group_comments(&f.issues, &f.comments);
-        assert_eq!(grouped.len(), f.issues.len());
-
         // 每张工单都排得出一篇非空文档，且抬头那句带真实日期
-        for (issue, cs) in &grouped {
+        for issue in &f.issues {
+            let cs = comments_for_issue(issue, &f.comments);
             let events = sort_events(
                 f.events_by_issue
                     .get(&issue.number.to_string())
@@ -435,14 +467,14 @@ mod tests {
                     .unwrap_or_default(),
             );
             let es: Vec<&Event> = events.iter().collect();
-            let doc = render(issue, cs, &es);
+            let doc = render(issue, &cs, &es);
             assert!(
                 doc.contains(&format!("# #{} ", issue.number)),
                 "#{} 的抬头不对：{doc}",
                 issue.number
             );
             assert!(
-                doc.contains(&issue.created_at.format("%Y-%m-%d").to_string()),
+                doc.contains(&super::stamp(issue.created_at)),
                 "#{} 正文里没有创建日期",
                 issue.number
             );
@@ -450,7 +482,8 @@ mod tests {
 
         // 这份夹具里每张工单都被关掉过，所以历史一节必须出现——
         // 它是这个来源存在的理由，空了就等于退回"抓一个网页"
-        let (first, cs) = &grouped[0];
+        let first = &f.issues[0];
+        let cs = comments_for_issue(first, &f.comments);
         let events = sort_events(
             f.events_by_issue
                 .get(&first.number.to_string())
@@ -459,7 +492,7 @@ mod tests {
         );
         assert!(!events.is_empty(), "夹具里 #{} 没有事件", first.number);
         let es: Vec<&Event> = events.iter().collect();
-        let doc = render(first, cs, &es);
+        let doc = render(first, &cs, &es);
         assert!(doc.contains("## History"), "历史一节缺失：{doc}");
         assert!(doc.contains("— closed by"), "关闭事件没写进历史：{doc}");
     }

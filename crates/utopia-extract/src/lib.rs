@@ -1,325 +1,86 @@
-//! utopia-extract: LLM 抽取（实体/关系/时间归一化）。
-//! 提示词注入本体类型与文档元时间；输出严格 JSON；证据引句强制（无引句降置信度）。
+//! utopia-extract：抽取用的提示词与解析。
+//!
+//! 开放抽取（[`open`]）是唯一的抽取契约（0044 决定 2）：模型用文档自己的话写陈述，
+//! 不读本体、不算日期。这里留的是它借用的零件（已知实体的句柄、文件开头的预算、
+//! JSON 取块与补括号）、实体消解的攒批裁决，以及量与时间的读法——本体属性的采纳、
+//! 工具参数、连接器都用它们。
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use utopia_llm::ChatMessage;
 
-#[derive(Debug, Deserialize)]
-pub struct Extraction {
-    #[serde(default)]
-    pub entities: Vec<ExtractedEntity>,
-    #[serde(default)]
-    pub facts: Vec<ExtractedFact>,
-    /// 逐项解析时被跳过的条目数。**必须报给调用方**——不报就是一次静默丢弃，
-    /// 与 #108「部分抽取报告成完成」同一类错
-    #[serde(skip)]
-    pub skipped_entities: usize,
-    #[serde(skip)]
-    pub skipped_facts: usize,
-    /// 模型的输出被截断，这里是修补后解析的
-    #[serde(skip)]
-    pub truncated: bool,
-}
+pub mod align;
+pub mod errata;
+pub mod governor;
+pub mod implication;
+pub mod ontology_agent;
+pub mod open;
+pub mod phrase_align;
+pub mod question_agent;
+pub mod time;
 
-#[derive(Debug, Deserialize)]
-pub struct ExtractedEntity {
-    pub name: String,
-    #[serde(rename = "type")]
+/// Response-scoped reference to a persistent entity; database UUIDs must never enter prompts.
+pub struct KnownEntity {
+    pub handle: String,
     pub type_key: String,
-    /// 模型自己的说法：它认为这最具体是个什么。**不校验、不入本体**。
-    ///
-    /// 存在的理由是清单里总有个"差不多"的：本体有 product，模型觉得够用就选了，
-    /// 心里那个"向量数据库软件"就此丢失。实测 17 个实体的 proposed_type
-    /// 全是空的，正是这个原因——而事后消解最需要的恰是这个名字：
-    /// 短名字对短标签，比拿一段中文散文去匹配 "A software application." 近得多。
-    #[serde(default)]
-    pub specific_type: Option<String>,
+    pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ExtractedFact {
-    pub subject: String,
-    pub predicate: String,
-    /// 关系事实的宾语实体名；属性事实为空
-    #[serde(default)]
-    pub object: Option<String>,
-    /// 属性事实的字面值（谓词是 attribute 时）
-    #[serde(default)]
-    pub value: Option<serde_json::Value>,
-    #[serde(default)]
-    pub valid_from: Option<String>,
-    #[serde(default)]
-    pub valid_to: Option<String>,
-    #[serde(default)]
-    pub confidence: Option<f32>,
-    #[serde(default)]
-    pub quote: Option<String>,
-}
+/// 文件开头进提示词的字符预算。一份补充协议的标题、生效日、当事方和「修订的是哪份
+/// 协议」通常在头一千字符里；新闻稿的电头与导语也是
+pub(crate) const OPENING_BUDGET_CHARS: usize = 1500;
 
-/// 提示词里的一条关系。
+/// 文件开头排版成提示词里的一段。开头为空（或只有空白）时返回空串；
+/// 「这一块就是开头本身」由调用方判断，那时它传 `None`。
 ///
-/// 比类多一样东西：**类型签名**。它是给模型的签名，不是闸门——在模型落笔那一刻
-/// 减少"Alice works_at 西雅图"，而不是等错了再拦。事后校验面对的是既成事实
-///（丢掉可惜、留着是脏数据），签名是在写出来之前掰正。本体写错时模型看到原文
-/// 说了别的仍可覆盖；硬闸门会系统性丢数据，`part_of` 烧我们的正是那种方式。
-pub struct PromptRelation {
-    pub key: String,
-    pub label: String,
-    pub description: String,
-    /// 形如 `person|organization → vendor`，`*` 表示那一侧不限。空串 = 两侧都不限。
-    /// **一律用 key**：模型要输出的就是 key，中文库里 person 的 label 是"人物"，
-    /// 写进签名等于教它输出一个不存在的类型（docs/decisions/0004）
-    pub signature: String,
-}
-
-/// 构造抽取提示词。`types` 为 (key, label, description) 三元组；
-/// description 非空时按行列出——本体里的语义指引直接决定抽取质量。
-/// `attributes` 为调用方预排版的属性行（"person.salary (number, CNY): 月薪"）；
-/// 为空时提示词一字不变——没定义属性的库零成本。
-pub fn build_messages(
-    types: &[(String, String, String)],
-    relations: &[PromptRelation],
-    attributes: &[String],
-    doc_time: Option<&str>,
-    filename: &str,
-    // 本文档前面几块已经认下的 (类型 key, 实体名)，按首次出现排序。
-    // 第一块为空——那时还没有"前面"
-    known: &[(String, String)],
-    chunk_text: &str,
-) -> Vec<ChatMessage> {
-    // **有描述时不送 label**。label 是给人看的显示名，而且它跟界面无关、
-    // 跟这个库的语料语言走——中文库里 person 的 label 是"人物"。
-    // `- person (人物): 有名有姓的具体的人…` 里那个"人物"相对 key 近乎零信息量，
-    // 却让提示词在语料语言与标识符之间来回跳。描述为空时才拿它兜底：
-    // 光一个 key 太单薄。见 docs/decisions/0004
-    let fmt_list = |items: &[(String, String, String)]| {
-        items
-            .iter()
-            .map(|(k, l, d)| {
-                let d = d.trim();
-                if d.is_empty() {
-                    format!("- {k} ({l})")
-                } else {
-                    format!("- {k}: {d}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+/// 按字符截：不会截断一个字符，但会截在词中间——英文的最后一个词可能只剩半个
+pub(crate) fn opening_block(opening: Option<&str>) -> String {
+    let Some(text) = opening.map(str::trim).filter(|t| !t.is_empty()) else {
+        return String::new();
     };
-    let type_list = fmt_list(types);
-    // 关系行：有签名时括号里放签名，没有才退回 label。
-    // `- works_at (person → organization): 一个人受雇于某个组织。`
-    let rel_list = relations
-        .iter()
-        .map(|r| {
-            let d = r.description.trim();
-            let paren = if !r.signature.is_empty() {
-                r.signature.clone()
-            } else if d.is_empty() {
-                r.label.clone()
-            } else {
-                String::new()
-            };
-            match (paren.is_empty(), d.is_empty()) {
-                (false, false) => format!("- {} ({paren}): {d}", r.key),
-                (false, true) => format!("- {} ({paren})", r.key),
-                (true, false) => format!("- {}: {d}", r.key),
-                (true, true) => format!("- {}", r.key),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // 记号只在真有签名时解释一次；没有签名的库，提示词一字不变。
-    // 说明用英文——提示词的**指令语言**是英文，只有 description 跟语料走
-    //
-    // **签名管两件事，而它们的可覆盖性不同。** 第一版把两件事混成了一句
-    // "It is a hint, not a rule — when the text says otherwise, write what the
-    // text says"，于是模型连参数顺序也一并按原文的说法写：
-    //
-    //     Elon Musk (person) --employee--> Microsoft
-    //
-    // 而 schema.org 声明的是 employee (organization → person)。实测一次跑里
-    // 130 条可校验的事实有 102 条这样反着落库——**恰恰是本体包最主要的卖点失效**，
-    // 选 schema.org 的理由就是「方向是声明的不是描述的」。
-    //
-    // 两件事分开说：
-    //
-    // - **哪些类型能参与**：提示不是闸门。本体可能写错，原文说西雅图就写西雅图。
-    //   0001 的判断在这里不变——硬闸门会系统性丢数据，part_of 烧我们的正是那样。
-    // - **参数顺序**：由签名定。顺序不是关于世界的断言，是这个 key 的编码约定；
-    //   原文从来没有「说了别的方向」，它只说两个实体之间存在某种关系。
-    //   反着说时该交换主宾，而不是反过来用这个关系。
-    let sig_note = if relations.iter().any(|r| !r.signature.is_empty()) {
-        ". A parenthesis after the key is the type signature, subject then object; \
-         \"|\" means or, \"*\" means unconstrained. Which kinds of things may take part \
-         is a hint, not a rule — when the text says otherwise, write what the text says. \
-         The order is not a hint: the signature fixes which side is the subject. If the \
-         text puts them the other way round, swap subject and object so that the subject \
-         matches the left side — do not reverse the relation. For example, given \
-         \"employee (organization → person)\" and a text saying \"X is an employee of Y\", \
-         write Y as the subject and X as the object"
+    let cut: String = text.chars().take(OPENING_BUDGET_CHARS).collect();
+    let more = if cut.chars().count() < text.chars().count() {
+        " …"
     } else {
         ""
     };
-    let time_ctx = doc_time
-        .map(|t| {
-            format!(
-                "Document date: {t}. Resolve relative time expressions (e.g. \"last year\", \
-                 \"this March\") to absolute dates using it as the reference."
-            )
-        })
-        .unwrap_or_else(|| {
-            "Document date unknown — only output dates explicitly written in the text.".into()
-        });
-
-    // 属性段按需注入：清单 + 输出说明 + 取值规则。没定义属性时完全不出现
-    let attr_section = if attributes.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nAttributes (literal-valued fields, listed as class.attribute_key; as \"predicate\" \
-             use the attribute_key alone — e.g. \"salary\", not \"person.salary\" — with a \
-             \"value\" instead of \"object\"):\n{}\n",
-            attributes.join("\n")
-        )
-    };
-    let attr_rules = if attributes.is_empty() {
-        String::new()
-    } else {
-        "\n10. Attribute facts carry \"value\" (no \"object\"): number = plain number without \
-         thousands separators or unit symbols; date = \"YYYY[-MM[-DD]]\"; bool = true/false; \
-         text = a short string. Only attach an attribute to a subject of its listed class. \
-         valid_from = when this value took effect, if the text says so."
-            .to_string()
-    };
-    let system = format!(
-        "You are a knowledge-graph extraction engine. Extract entities and factual relations \
-         from the given text. Output exactly one JSON object and nothing else.\n\
-         \n\
-         Entity types (prefer these keys):\n{type_list}\n\
-         \n\
-         Relation types (prefer these keys){sig_note}:\n{rel_list}\n\
-         {attr_section}\
-         \n\
-         Output format:\n\
-         {{\"entities\":[{{\"name\":\"entity name\",\"type\":\"type key\",\"specific_type\":\"what you would call it\"}}],\n\
-          \"facts\":[{{\"subject\":\"subject entity name\",\"predicate\":\"relation key\",\"object\":\"object entity name\",\n\
-                     \"valid_from\":\"2023-01\",\"valid_to\":null,\"confidence\":0.9,\"quote\":\"verbatim supporting quote\"}}]}}\n\
-         \n\
-         Rules:\n\
-         1. Use the canonical full name as written in the text, in the text's original language; \
-            list each entity once. Text introduces a full name and then shortens it — \
-            \"星云科技上海研究院\" becomes \"上海研究院\", \"Nebula Technologies Inc.\" becomes \
-            \"Nebula\" — and both forms mean one entity, listed once under the fuller form. \
-            Two names are two entities only when the text is talking about two things.\n\
-         2. Every fact's subject/object must appear in entities.\n\
-         3. Dates must be \"YYYY\", \"YYYY-MM\", \"YYYY-MM-DD\", or null — never invent dates.\n\
-         3a. valid_to takes a third value: \"unknown\". Use it when the text says the relation \
-            has ended but does not say when — \"former CEO of X\", \"stepped down\", \"left the \
-            company\", \"no longer available\", \"until recently\". Use null only for something \
-            still going on. These are not interchangeable: null asserts it still holds, and \
-            writing null for a relation the text says is over makes us claim the opposite of \
-            the source.\n\
-         4. {time_ctx}\n\
-         5. quote must be a contiguous excerpt from the source text; every fact needs one.\n\
-         6. confidence in 0~1: 0.9 explicitly stated, 0.7 inferred, 0.5 uncertain.\n\
-         7. If nothing can be extracted, output {{\"entities\":[],\"facts\":[]}}.\n\
-         8. If no listed relation fits, do not force the nearest one — write the predicate the \
-            text itself uses, in snake_case (e.g. \"available_on\", \"runs_on\"). A relation \
-            named after the text is worth more than a listed one that says something false.\n\
-         9. The same holds for entity types: if none of the listed types fits, write the type \
-            the text implies, in snake_case (e.g. \"model\", \"technology\"). Do not fall back \
-            to a broad listed type such as \"thing\" or \"creative_work\" merely because \
-            nothing specific matched — that hides the gap instead of reporting it.\n\
-         10. specific_type is required on every entity and is never checked against the list. \
-            Name the most specific kind the thing is, in the words you would use for it. Write \
-            it even when \"type\" already fits, and make it narrower than \"type\" wherever the \
-            text supports it — type \"product\", specific_type \"vector database software\". \
-            Repeat the listed type only when the text genuinely says nothing more precise.\
-         {attr_rules}"
-    );
-
-    // 已知实体紧挨着正文：服从性靠位置，理由见 known_block 的注释
-    let user = format!(
-        "Source file: \"{filename}\"\n{}\nText:\n{chunk_text}",
-        known_block(known)
-    );
-
-    vec![
-        ChatMessage {
-            role: "system".into(),
-            content: system,
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: user,
-        },
-    ]
+    format!(
+        "\nOpening of this document, for context only (do not extract facts from it; they are \
+         extracted from that part separately). Use it to know what the text below belongs to — \
+         which agreement, company or event it concerns, who the parties are, and the date it \
+         takes effect — so that facts in the text below attach to the right entity and carry \
+         the right dates:\n\"\"\"\n{cut}{more}\n\"\"\"\n"
+    )
 }
 
 /// 已在本文档中出现过的实体，放进提示词的字符预算。
 ///
 /// 超出就截断（保留先出现的）。中文商业文本先出全称、主角先出场，所以
 /// **首次出现顺序天然偏向那些后面会被简称的名字**。
-const KNOWN_BUDGET_CHARS: usize = 1200;
+pub(crate) const KNOWN_BUDGET_CHARS: usize = 1200;
 
-/// 把「本文档已经认下的实体」排版成提示词里的一段。空则返回空串。
-///
-/// **为什么在正文之前、指令贴着清单**：抽象规则打不过挨着它的具体块——本体建议
-/// 那次，语言要求就输给了紧随其后的英文 JSON 骨架，挪到骨架之后并点名它才生效。
-/// 服从性靠位置，所以指令挨着它管的数据放，两者一起挨着正文。
-///
-/// **顺带一条与放哪条消息无关的规矩：逐块变化的内容一律放最后。** 前缀缓存匹配的是
-/// token 前缀，而消息按 system→user 拼接，所以「system 末尾」与「user 开头」几乎等价；
-/// 真正会打碎缓存的是把它塞在**中间**（本体之后、规则之前），那会把规则挤出前缀。
-/// 缓存本身不归我们管——供应商开不开、报不报都由它，本部署实测 `cached=0`——
-/// 我们只负责别把它弄碎。自部署 vLLM 默认开着自动前缀缓存，那省的是算力不是钱。
-fn known_block(known: &[(String, String)]) -> String {
-    if known.is_empty() {
-        return String::new();
-    }
-    // 按类型分组：更紧凑，而且顺带压住跨块类型漂移
-    //（同一个"沧海"在一块里是 product、另一块里是 project）
-    let mut by_type: Vec<(&str, Vec<&str>)> = Vec::new();
-    let mut used = 0usize;
-    for (type_key, name) in known {
-        used += name.chars().count() + 2;
-        if used > KNOWN_BUDGET_CHARS {
-            break;
-        }
-        match by_type.iter_mut().find(|(k, _)| *k == type_key.as_str()) {
-            Some((_, names)) => names.push(name),
-            None => by_type.push((type_key, vec![name])),
-        }
-    }
-    if by_type.is_empty() {
-        return String::new();
-    }
-    let lines = by_type
-        .iter()
-        .map(|(k, names)| format!("  {k}: {}", names.join(", ")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "\nAlready recorded from earlier parts of this same document:\n{lines}\n\
-         \n\
-         If something in the text below refers to one of these, write that exact string as \
-         the name, and give it that same type — documents abbreviate after first mention \
-         (\"星云科技上海研究院\" later becomes \"上海研究院\"), and the shortened form must \
-         not become a second entity. If it is a different thing, name it as the text does; \
-         do not force it onto this list.\n"
-    )
+/// 回复里可能是 JSON 的那段文字：切掉思考过程与代码围栏。前后的废话留给调用方按
+/// 括号定位——[`json_block`] 取第一个 `{` 到最后一个 `}`；开放抽取的截断修补则从
+/// 第一个 `{` 取到结尾，那边的记录是数组，最后一个 `}` 不是可靠的结尾
+pub(crate) fn json_text(raw: &str) -> &str {
+    let text = raw.trim();
+    // 推理模型的思考过程（#690）：`LlmClient::chat` 那边会先切，但取块这一层
+    // 自己认得标记才是最后的保障——`chat_tools` 那条路就不经过 `chat`。
+    // 不切的话，思考过程里的大括号会把下面"第一个 `{`"的起点提前，
+    // 而修补截断的逻辑认不出夹在中间的废话，整块直接作废。
+    let text = match text.rfind("</think>") {
+        Some(pos) => text[pos + "</think>".len()..].trim(),
+        None => text,
+    };
+    text.strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .map(|s| s.trim_end_matches("```"))
+        .unwrap_or(text)
 }
 
 /// 从 LLM 回复中稳健地取出 JSON 块（容忍代码围栏与前后废话）。
 pub fn json_block(raw: &str) -> anyhow::Result<String> {
-    let text = raw.trim();
-    let cleaned = text
-        .strip_prefix("```json")
-        .or_else(|| text.strip_prefix("```"))
-        .map(|s| s.trim_end_matches("```"))
-        .unwrap_or(text);
+    let cleaned = json_text(raw);
     let start = cleaned.find('{');
     let end = cleaned.rfind('}');
     match (start, end) {
@@ -331,7 +92,7 @@ pub fn json_block(raw: &str) -> anyhow::Result<String> {
 /// 把 head 后面缺的括号补上。字符串字面量里的括号不算——`"a[b"` 不是一个开括号。
 ///
 /// 返回 None = 结构本身就不对（比如括号已经多了），不是"没写完"。
-fn close_brackets(head: &str) -> Option<String> {
+pub(crate) fn close_brackets(head: &str) -> Option<String> {
     let mut stack: Vec<char> = Vec::new();
     let (mut in_str, mut esc) = (false, false);
     for c in head.chars() {
@@ -369,91 +130,41 @@ fn close_brackets(head: &str) -> Option<String> {
     Some(out)
 }
 
-/// 输出被截断时，退到**最后一个完整对象**的结尾再把括号补齐。
-///
-/// 模型写到一半没了（撞上 max_tokens）时，前面那些对象是完整且正确的。
-/// 整块作废等于把已经抽对的十几条事实一起扔掉——实测 246 次调用里 4 次是这种。
-fn repair_truncated(json: &str) -> Option<String> {
-    let mut cut = json.len();
-    for _ in 0..64 {
-        let idx = json[..cut].rfind('}')?;
-        if let Some(closed) = close_brackets(&json[..=idx]) {
-            if serde_json::from_str::<serde_json::Value>(&closed).is_ok() {
-                return Some(closed);
-            }
-        }
-        cut = idx;
-    }
-    None
-}
-
-/// **一条坏记录不该毁掉一整块。**
-///
-/// 从前这里是 `serde_json::from_str::<Extraction>`——全有或全无。一个缺 `predicate`
-/// 的对象、或者一次输出截断，整块的实体和事实一起作废，而一块里常有二十条好事实。
-/// 实测 246 次调用里 5 次这样丢掉（2%），并且会让整个 `extract_document` 任务失败、
-/// 走重试，三次之后文档标记失败。
-///
-/// 现在：先解成 `Value`（截断就先补齐括号），再逐项 `from_value`，好的收下、
-/// 坏的计数。**计数必须往外传**——静默跳过就是另一种"报告成完成"。
-pub fn parse_response(raw: &str) -> anyhow::Result<Extraction> {
-    let json_str = json_block(raw)?;
-    let (value, truncated) = match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(v) => (v, false),
-        Err(e) => match repair_truncated(&json_str) {
-            Some(fixed) => (
-                serde_json::from_str::<serde_json::Value>(&fixed)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse extraction JSON: {e}"))?,
-                true,
-            ),
-            // 补不回来才是真解析失败：连一个完整对象都没有
-            None => anyhow::bail!("Failed to parse extraction JSON: {e}"),
-        },
-    };
-
-    fn take<T: serde::de::DeserializeOwned>(
-        value: &serde_json::Value,
-        key: &str,
-    ) -> (Vec<T>, usize) {
-        let Some(arr) = value.get(key).and_then(|v| v.as_array()) else {
-            return (Vec::new(), 0);
-        };
-        let mut out = Vec::with_capacity(arr.len());
-        let mut skipped = 0;
-        for item in arr {
-            match serde_json::from_value::<T>(item.clone()) {
-                Ok(v) => out.push(v),
-                Err(_) => skipped += 1,
-            }
-        }
-        (out, skipped)
-    }
-
-    let (entities, skipped_entities) = take::<ExtractedEntity>(&value, "entities");
-    let (facts, skipped_facts) = take::<ExtractedFact>(&value, "facts");
-    Ok(Extraction {
-        entities,
-        facts,
-        skipped_entities,
-        skipped_facts,
-        truncated,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // 实体消解裁决（攒批：一次调用裁多对，LLM 只处理 embedding 分不出的灰区）
 // ---------------------------------------------------------------------------
 
 /// 待裁决的一侧：名字 + 类型 + 事实摘要行。
+#[derive(Debug, Clone)]
 pub struct AdjudicationSide {
     pub name: String,
     pub type_label: String,
     pub facts: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct AdjudicationPair {
     pub left: AdjudicationSide,
     pub right: AdjudicationSide,
+    /// 这个库里的人对这一对、这个名字、这种类型对做过什么（0025）。空就不提
+    pub precedents: Vec<String>,
+    /// 这一对是**怎么**被提出来的，只在提议依据不是「同名」时写：名字向量召回（0041 第 2 刀）
+    /// 提的是两个**不同的字符串**，裁决器不知道这一点就会把「张伟」当成「财务部总监张伟」
+    /// 去掉限定词后的同一个人——测量台上那次错合就是这么来的。空就不提，同名对照旧
+    pub proposed_because: Option<String>,
+}
+
+/// 名字向量召回提的对，写成裁决器读得懂的一句提议依据；`cosine` 是召回记下的余弦文本
+/// （`utopia_core::review_reasons::name_vector_cosine` 从审核对的 reason 里取）。其余原因
+/// （同名灰区、同名并列、包含）都是「同一个字符串」的家族，裁决器的规则本来就是为它们写的，
+/// 传 None
+pub fn proposed_because(cosine: Option<&str>) -> Option<String> {
+    let cosine = cosine?;
+    Some(format!(
+        "the names are similar but NOT the same string (name-vector cosine {cosine}): this may be a \
+         short form, another script, or a different thing with a similar name; a dropped qualifier is \
+         not evidence here, the facts are"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,6 +173,9 @@ pub struct AdjudicationVerdict {
     pub verdict: String,
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// 一句理由；带先例的裁决要说依据了哪条
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,38 +185,105 @@ struct AdjudicationReply {
 }
 
 /// 构造攒批裁决提示词。保守偏置：证据不足答 unsure（宁分勿合，合并要证据）。
+/// 身份规则（0025 第一轮迭代，2026-09-07）：攒批与工具循环两个提示词共用。
+///
+/// 从 ai-timeline 真值上量出来的四种错：版本并进系列、「X 的 Y」并进 X、列表并进成员、
+/// 子公司并进母公司；以及同名被「类型标签不同」「合作伙伴不同」拆开。每一条都写成
+/// 一句规则加例子，例子取自那份语料。
+pub const IDENTITY_RULES: &str = "\
+A record is one specific thing in the world: a person, an organization, a legal entity, a \
+product, one version of a product, a document, an event, a place, or a concept. Two records \
+are the SAME only when they denote exactly the same thing.\n\
+\n\
+Names:\n\
+- The same proper name, compatible kinds, and no real contradiction: the same thing. Type \
+  labels were assigned by an extractor and are noisy: Organization, Corporation, \
+  ResearchOrganization, NGO and Store can all be one company; SoftwareApplication, \
+  CreativeWork, Intangible, Product, Service, Offer and ComputerLanguage can all be one \
+  product; Place and State can be one state. Only incompatible kinds count as a difference: \
+  a person against a company, a place against a product, an event against an organization. \
+  For identical proper names answer \"different\" only when you can name the contradiction \
+  in one sentence; a type label, a missing fact, fewer facts, or different partners, \
+  products, roles or events is not one. Never treat the absence of facts as a difference.\n\
+- A surname or a first name alone against a full name that contains it, in the same \
+  documents, is the same person unless another person with that name appears: \"Pachocki\" \
+  is \"Jakub Pachocki\", \"Kwon\" is \"Jason Kwon\", \"Nadella\" is \"Satya Nadella\". A person \
+  who moved between two organizations is still one person.\n\
+- A parenthetical acronym, an expanded acronym or a fuller product designation is the same \
+  thing: \"reinforcement learning (RL)\" is \"reinforcement learning\", \"US Federal Trade \
+  Commission (FTC)\" is \"Federal Trade Commission\", \"MI450\" is the \"AMD Instinct MI450\".\n\
+- A name that is the other name with a qualifier removed from the FRONT is usually the same \
+  thing abbreviated: \"Google DeepMind\" and \"DeepMind\", \"Adam D'Angelo\" and \"D'Angelo\", \
+  \"Meta Platforms\" and \"Meta\", \"Altimeter Capital\" and \"Altimeter\", \"The New York \
+  Times\" and \"New York Times\", \"Apple Inc.\" and \"Apple\". Documents drop the qualifier \
+  after first mention.\n\
+- A name that is the other name with something ADDED AT THE END is a different, more \
+  specific thing: a version or edition (\"Claude 4 Opus\" is not \"Claude\", \"AlphaFold2\" is \
+  not \"AlphaFold\", \"Genie 2\" is not \"Genie\", \"GPT-4.5\" is not \"GPT-4\", \"2024 \
+  International Mathematical Olympiad\" is not \"International Mathematical Olympiad\"), a \
+  variant or tier (\"Gemini Robotics-ER\" is not \"Gemini Robotics\", \"Claude 3 Haiku\" is \
+  not \"Haiku\"), a division, subsidiary or legal entity (\"DeepMind Health\" is not \
+  \"DeepMind\", \"OpenAI Ireland Ltd\" is not \"OpenAI\", \"Microsoft AI\" is not \
+  \"Microsoft\"), a project, programme, team, app or component. Never merge a version into \
+  its family or a part into its whole.\n\
+- A document, agreement or filing is cited in many ways and stays one thing through its \
+  amendments: \"the Lease\", \"Lease Agreement\", \"Lease Agreement dated May 16, 2016\" and \
+  \"Lease Agreement dated May 16, 2016, as amended\" are one agreement when their parties and \
+  subject do not contradict each other. When it was signed and that it was amended describe \
+  the agreement; they do not make a second one. Each amendment is a document of its own, and \
+  an agreement for other premises, another phase or other parties (\"Phase 2 Lease\") is a \
+  different agreement.\n\
+- A phrase that merely contains a name is not that name: \"Sam Altman's efforts\", \
+  \"psychological abuse from Sam Altman\", \"share sale led by Thrive Capital\", \"leaked \
+  letter from the National Data Guardian\", \"ChatGPT played a role in the campaign\", \"a \
+  consistent pattern of lying\". These describe something about the thing; they are not the \
+  thing.\n\
+- A list of names (\"MuZero, AlphaStar, AlphaGeometry\") is not any of its members.\n\
+- A common noun or generic phrase (\"employees\", \"users\", \"lawsuit\", \"investors\", \
+  \"event\", \"safety\") is not a proper name. Two such records are the same only when their \
+  facts show they are one specific instance; usually they are different.\n\
+- When the facts of either record describe ownership, control, a subsidiary, a holding or \
+  a parent relation between the two names, or show one of them as one legal entity among \
+  several in a group (\"OpenAI, Inc. controls the for-profit company\", \"OpenAI GP LLC \
+  controls OpenAI LP\"), they are two entities even if one name is the other plus a \
+  corporate suffix. A group and its legal entities are different records.\n\
+\n\
+Facts:\n\
+- Different facts are not contradictory facts. One company has many partnerships, investors, \
+  lawsuits and contracts; a person changes jobs; one product is praised in one document and \
+  criticised in another. A contradiction is two facts that cannot both hold of one thing at \
+  once: two different founders, two headquarters at the same time, two different birth dates, \
+  or affiliations that overlap in time and exclude each other. Only a contradiction is \
+  evidence of difference.\n\
+- A record with no facts contributes nothing; the name and the other record decide.";
+
 pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessage> {
-    let system = "You are an entity-resolution adjudicator for a knowledge graph. \
-        For each numbered pair, decide whether the two records refer to the SAME real-world \
-        entity or are namesakes (different entities that share a name).\n\
-        \n\
-        Judge by the facts attached to each record: employer/affiliation, role, time ranges, \
-        and connected entities. Identical names alone are NEVER sufficient evidence of sameness. \
-        Contradictory affiliations in overlapping time periods indicate different entities \
-        (but people do change jobs — non-overlapping periods can belong to one person).\n\
-        \n\
-        One name containing the other is a different case, and the rule above does not apply \
-        to it: \"星云科技上海研究院\" against \"上海研究院\", \"Nebula Technologies Inc.\" \
-        against \"Nebula\". Documents drop the qualifier after first mention, so the shorter \
-        form is usually the longer one abbreviated — treat the containment as evidence FOR \
-        sameness and let the facts settle it. Shared people, parent or location confirm one \
-        entity; a different parent or conflicting leadership means the shorter name belongs \
-        to something else.\n\
-        Abbreviation removes a qualifier from the FRONT. It never adds a noun or a \
-        prepositional phrase at the end, so those are different entities however much text \
-        they share: \"the operator library for the Canghai Platform\" is not the Canghai \
-        Platform, \"Qiming X7 programme\" is not the Qiming X7, and \"沧海平台项目\" is not \
-        \"沧海平台\" — a project, a programme, a team or a component is its own record.\n\
-        \n\
-        Output exactly one JSON object and nothing else:\n\
-        {\"verdicts\":[{\"i\":0,\"verdict\":\"same|different|unsure\",\"confidence\":0.9}]}\n\
-        \n\
-        Rules:\n\
-        1. One verdict per pair, using the pair's number as \"i\".\n\
-        2. confidence in 0~1.\n\
-        3. Be conservative: if the evidence is insufficient to decide, answer \"unsure\" — \
-           a wrong merge is far more damaging than leaving two records separate."
-        .to_string();
+    let system = format!(
+        "You are an entity-resolution adjudicator for a knowledge graph. For each numbered \
+         pair, decide whether the two records refer to the SAME real-world thing or are two \
+         things that share a name.\n\
+         \n\
+         {IDENTITY_RULES}\n\
+         \n\
+         Some pairs carry precedents: decisions people made in this same knowledge base on \
+         these names, or on pairs of the same two types. Treat them as how the owners of this \
+         base want such cases judged. Follow a precedent on the same pair unless the facts of \
+         this pair clearly differ from it; when precedents disagree with each other, answer \
+         \"unsure\". A precedent never overrides a contradiction in the facts. Some precedents quote what the person wrote when deciding: weigh that stated ground, not only the outcome; a decision made for a reason that does not hold here is not a precedent for this pair.\n\
+         \n\
+         Output exactly one JSON object and nothing else:\n\
+         {{\"verdicts\":[{{\"i\":0,\"verdict\":\"same|different|unsure\",\"confidence\":0.9,\
+         \"why\":\"one sentence\"}}]}}\n\
+         \n\
+         Rules:\n\
+         1. One verdict per pair, using the pair's number as \"i\".\n\
+         2. confidence in 0~1.\n\
+         3. \"why\" is one short sentence; when a precedent decided it, say which.\n\
+         4. A wrong merge is far more damaging than leaving two records separate: answer \
+            \"same\" only when the rules above make it so; when a rule says two things, say \
+            \"different\" with confidence, not \"unsure\"; \"unsure\" is for evidence that \
+            genuinely points both ways."
+    );
 
     let mut user = String::new();
     for (i, p) in pairs.iter().enumerate() {
@@ -518,8 +299,24 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
             };
             format!("\"{}\" ({})\n{}", s.name, s.type_label, facts)
         };
+        let precedents = if p.precedents.is_empty() {
+            String::new()
+        } else {
+            let lines = p
+                .precedents
+                .iter()
+                .map(|l| format!("  - {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Precedents (decided by people in this base):\n{lines}\n")
+        };
+        let why_paired = p
+            .proposed_because
+            .as_deref()
+            .map(|w| format!("Why paired: {w}\n"))
+            .unwrap_or_default();
         user.push_str(&format!(
-            "Pair {i}:\nRecord A: {}\nRecord B: {}\n\n",
+            "Pair {i}:\nRecord A: {}\nRecord B: {}\n{why_paired}{precedents}\n",
             fmt(&p.left),
             fmt(&p.right)
         ));
@@ -538,19 +335,349 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
 }
 
 pub fn parse_adjudication(raw: &str) -> anyhow::Result<Vec<AdjudicationVerdict>> {
+    parse_adjudication_repairing(raw).map(|(verdicts, _)| verdicts)
+}
+
+/// 同 `parse_adjudication`，另回一个「修补过没有」。
+///
+/// 模型在引号里的理由中间直接换行——JSON 不许字符串里出现裸控制字符，serde
+/// 会报 `control character (\u0000-\u001F) found while parsing a string`。一批
+/// 几十对的裁决为一个换行整批作废、重试三次同样的回复再整批作废，队里的对
+/// 就一直挂着（Re-DocRED 一百篇上挂了 2903 条）。先按原样解；解不开就把字符串
+/// 字面量里的控制字符转义成 `\n`、`\t`、`\u00XX` 再解一次。字符串外的
+/// 换行本来就是合法空白，不动。修补与否只改 bool，裁决本身一样：形状好的回复
+/// 走第一条路，与从前没有分别。调用方拿到 true 就记一条 WARN 说明是哪一批
+pub fn parse_adjudication_repairing(raw: &str) -> anyhow::Result<(Vec<AdjudicationVerdict>, bool)> {
     let json_str = json_block(raw)?;
-    let reply: AdjudicationReply = serde_json::from_str(&json_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse adjudication JSON: {e}"))?;
-    Ok(reply.verdicts)
+    match serde_json::from_str::<AdjudicationReply>(&json_str) {
+        Ok(reply) => Ok((reply.verdicts, false)),
+        Err(first) => {
+            let escaped = escape_control_in_strings(&json_str);
+            if escaped == json_str {
+                anyhow::bail!("Failed to parse adjudication JSON: {first}");
+            }
+            let reply: AdjudicationReply = serde_json::from_str(&escaped)
+                .map_err(|e| anyhow::anyhow!("Failed to parse adjudication JSON: {e}"))?;
+            Ok((reply.verdicts, true))
+        }
+    }
+}
+
+/// 把字符串字面量里的裸控制字符（U+0000–U+001F）写成 JSON 转义；字面量外的原样。
+/// 引号与反斜杠的跟踪同 `close_brackets`：`\"` 不结束字符串
+pub(crate) fn escape_control_in_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_str, mut esc) = (false, false);
+    for c in text.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            } else if c.is_control() && (c as u32) < 0x20 {
+                match c {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    other => out.push_str(&format!("\\u{:04x}", other as u32)),
+                }
+                continue;
+            }
+        } else if c == '"' {
+            in_str = true;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 一个**整体就是一个量**的字符串 → (数值, 单位)。
+///
+/// 判据从严：可选货币符号 + 数字 + 可选量级词 + 可选百分号，此外**一个词都不许有**。
+/// 尾巴上还挂着实词的，含义就不再只是那个数：
+///
+/// ```text
+/// "$5 billion"                        → (5e9, Some("$"))
+/// "52%"                               → (52.0, Some("%"))
+/// "3.5 million"                       → (3.5e6, None)
+/// "35,000"                            → (35000.0, None)
+/// "900 million weekly active users"   → None   后面还有实词
+/// "2025 Atlantic hurricane season"    → None   那是一场赛事，不是 2025
+/// "8GW data center"                   → None
+/// "3M"                                → None   那是一家公司
+/// ```
+///
+/// **量级词只认全写**。单字母后缀（`3M`、`5k`、`2B`）看着省事，代价是把 3M、
+/// K2、B1 这些名字读成数字——一个真实体被读成量值，事实的形状就错了，
+/// 而错的那一头是不可逆的：节点没建，名字也没留下。
+///
+/// **单位照抄符号，不猜币种。** `$` 可能是美元、加元、澳元，`¥` 可能是日元或
+/// 人民币。猜出来的 "USD" 是一条没人负责的断言，而原文写的 `$` 是事实。
+pub fn parse_quantity(s: &str) -> Option<(f64, Option<String>)> {
+    scan_quantity(s, true).map(|q| (q.n, q.unit))
+}
+
+/// 开头是一个量、后面还挂着词的 → 那个量。`"1,250 people"` → (1250, "people")。
+///
+/// **这是给已经知道要什么的地方用的**，与 `parse_quantity` 的严不是一回事。
+/// `parse_quantity` 要判「这串字是不是一个东西」，判错就把一个真实体吃掉，
+/// 所以尾巴上有实词一律不认。而这里的调用方手上已经有一条声明了
+/// `datatype = number` 的属性——问的不再是「是不是数」，是「那个数是多少」，
+/// 判错的代价只是一个值不对，量级差着好几档。
+pub fn parse_leading_quantity(s: &str) -> Option<(f64, Option<String>)> {
+    scan_quantity(s, false).map(|q| (q.n, q.unit))
+}
+
+/// 货币：符号、ISO 码、中英文单词，统一成符号。**只认这张表**，认不出的不猜。
+pub(crate) fn currency_unit(tok: &str) -> Option<&'static str> {
+    Some(
+        match tok.trim_matches(|c: char| c == ',' || c == '.' || c == ';') {
+            "$" | "USD" | "usd" | "US$" | "dollar" | "dollars" | "美元" => "$",
+            "€" | "EUR" | "eur" | "euro" | "euros" | "欧元" => "€",
+            "£" | "GBP" | "gbp" | "pound" | "pounds" | "英镑" => "£",
+            "¥" | "JPY" | "jpy" | "yen" | "日元" => "¥",
+            "CNY" | "cny" | "RMB" | "rmb" | "yuan" | "人民币" | "元" | "元人民币" | "人民币元" => {
+                "¥"
+            }
+            "HKD" | "hkd" | "HK$" | "港元" | "港币" => "HK$",
+            "₩" | "KRW" | "won" | "韩元" => "₩",
+            "₹" | "INR" | "rupee" | "rupees" | "卢比" => "₹",
+            _ => return None,
+        },
+    )
+}
+
+/// 量级词对应的十进制指数：英文全写，中文千/万/亿。**不认单字母**（`3M` 是一家公司）。
+fn magnitude(tok: &str) -> Option<u8> {
+    Some(match tok {
+        "thousand" | "千" => 3,
+        "万" => 4,
+        "million" | "百万" => 6,
+        "千万" => 7,
+        "亿" => 8,
+        "billion" | "十亿" => 9,
+        "trillion" | "万亿" => 12,
+        _ => return None,
+    })
+}
+
+/// 把 `2亿美元`、`15亿元人民币`、`€30 million`、`30 million euros`、`USD 30m`（不认 m）
+/// 这类写法拆成 [前缀货币] 数字 [量级] [后缀货币/单位] [其余]。
+/// `strict` = 整体必须就是一个量：其余部分非空就不认。
+fn scan_quantity(s: &str, strict: bool) -> Option<Quantity> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (body, percent) = match s.strip_suffix('%') {
+        Some(b) => (b.trim_end(), true),
+        None => (s, false),
+    };
+    // 1. 前缀货币：符号紧贴，或 ISO 码/单词后跟空格
+    let mut rest = body;
+    let mut currency: Option<&'static str> = None;
+    if let Some(c) = rest.chars().next() {
+        if let Some(u) = currency_unit(&c.to_string()) {
+            currency = Some(u);
+            rest = rest[c.len_utf8()..].trim_start();
+        }
+    }
+    if currency.is_none() {
+        if let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+            if let Some(u) = currency_unit(head) {
+                currency = Some(u);
+                rest = tail.trim_start();
+            }
+        }
+    }
+    // 2. 数字：前导的 [-+0-9.,_]
+    let num_end = rest
+        .char_indices()
+        .find(|(_, c)| !matches!(c, '0'..='9' | '.' | ',' | '_' | '-' | '+'))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let (num, after) = rest.split_at(num_end);
+    let cleaned: String = num.chars().filter(|c| !matches!(c, ',' | '_')).collect();
+    let mut n: f64 = cleaned.parse().ok()?;
+    // 3. 数字后面：紧贴或空格隔开的量级词、货币词，逐个吃；吃不动的就是「其余」
+    let mut tail = after.trim_start();
+    let mut unit: Option<String> = None;
+    let mut ate_magnitude = false;
+    loop {
+        if tail.is_empty() {
+            break;
+        }
+        // 取下一个记号：中文按字（量级/货币词最长两三个字），其它按空白分词
+        let (tok, next) = next_token(tail);
+        if !ate_magnitude {
+            if let Some(m) = magnitude(tok) {
+                // Parse the written decimal with its scale in one conversion. Multiplying
+                // an already rounded f64 needs an epsilon that can erase real fractions.
+                // The suffix is at most three bytes (e12), so allocation stays O(num.len()).
+                n = format!("{cleaned}e{m}").parse().ok()?;
+                ate_magnitude = true;
+                tail = next.trim_start();
+                continue;
+            }
+        }
+        if unit.is_none() && currency.is_none() {
+            if let Some(u) = currency_unit(tok) {
+                unit = Some(u.to_string());
+                tail = next.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    if percent && (currency.is_some() || unit.is_some()) {
+        return None;
+    }
+    if !n.is_finite() {
+        return None;
+    }
+    let unit = if percent {
+        Some("%".to_string())
+    } else {
+        currency.map(str::to_string).or(unit)
+    };
+    if strict && !tail.is_empty() {
+        return None;
+    }
+    // 宽松：其余部分的第一个词当单位（`1,250 people` → people），没有货币时才用
+    let unit = unit.or_else(|| (!tail.is_empty()).then(|| next_token(tail).0.to_string()));
+    Some(Quantity {
+        n,
+        unit,
+        scaled: ate_magnitude,
+    })
+}
+
+/// 读出来的一个量。`n` 已经乘上了量级词；`scaled` 记下原文写没写量级词——换算到属性
+/// 声明的单位时要知道 `5000` 是原文就这么写的数，还是 `5000万` 展开出来的
+struct Quantity {
+    n: f64,
+    unit: Option<String>,
+    scaled: bool,
+}
+
+/// 「约」「左右」这类只说数是个约数的词。去掉它们数还是那个数；「超过」「余」不在这里：
+/// 它们说的是一个界，把界当成值就是一条原文没说的断言
+fn strip_approx(s: &str) -> &str {
+    let mut s = s.trim();
+    for p in [
+        "大约",
+        "约合",
+        "将近",
+        "接近",
+        "约",
+        "近",
+        "about ",
+        "approximately ",
+        "around ",
+        "roughly ",
+        "nearly ",
+        "~",
+        "≈",
+    ] {
+        if let Some(rest) = s.strip_prefix(p) {
+            s = rest.trim_start();
+            break;
+        }
+    }
+    s.strip_suffix("左右").map_or(s, str::trim_end)
+}
+
+/// 计数的量词：`1200人`、`350名`、`32家`。数后面只跟这一个词的，整体还是一个数
+const COUNTERS: &[&str] = &[
+    "人",
+    "名",
+    "位",
+    "个",
+    "家",
+    "台",
+    "件",
+    "项",
+    "岁",
+    "次",
+    "座",
+    "所",
+    "户",
+    "辆",
+    "种",
+    " people",
+    " employees",
+    " staff",
+];
+
+/// 一个宾语的名字是不是其实是个值：一个量（带量级词、货币、百分号或计数量词）或一个
+/// 写法说得清的日期。开放抽取里模型有时把「成立于 2015年3月12日」「注册资本为
+/// 5000万元」的值列成东西写进宾语，签名于是成了两样东西之间的关系，永远对不上属性。
+///
+/// **光秃秃的一个数只在它不是点了名的东西时才算值**：`1200` 是个数，而被点了名的
+/// `1984`、`360` 多半是一本书、一家公司——吃掉一个真实体是不可逆的，留一条数
+/// 在宾语上只是少绑一个属性
+pub fn literal_object(name: &str, named: bool) -> bool {
+    let t = strip_approx(name);
+    if t.is_empty() {
+        return false;
+    }
+    if written_date(t).is_some() || t.contains(['-', '/', '.']) && parse_time(t).is_some() {
+        return true;
+    }
+    match scan_quantity(t, true) {
+        Some(q) if q.unit.is_some() || q.scaled => true,
+        Some(_) => !named,
+        None => COUNTERS.iter().any(|c| {
+            t.strip_suffix(c)
+                .and_then(|r| scan_quantity(r.trim_end(), true))
+                .is_some_and(|q| q.unit.is_none())
+        }),
+    }
+}
+
+/// 下一个记号：ASCII 按空白切；CJK 试最长三字、两字、一字里能认出的量级/货币词，
+/// 都认不出就取到下一个空白为止
+fn next_token(s: &str) -> (&str, &str) {
+    let first = s.chars().next().unwrap_or(' ');
+    if first.is_ascii() {
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        return (&s[..end], &s[end..]);
+    }
+    let idx: Vec<usize> = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .collect();
+    for len in [4usize, 3, 2, 1] {
+        if idx.len() > len {
+            let cand = &s[..idx[len]];
+            if magnitude(cand).is_some() || currency_unit(cand).is_some() {
+                return (cand, &s[idx[len]..]);
+            }
+        }
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    (&s[..end], &s[end..])
 }
 
 /// 属性值按 datatype 归一。失败返回 None——宁缺勿脏，调用方跳过并记日志。
-/// number 容忍千分位/空格；date 要求 YYYY[-MM[-DD]] 且保留原精度；bool 宽容 yes/no。
+/// number 容忍千分位/空格；date 收规则 3 的格式（YYYY[-MM[-DD]]、带时区的时刻，原样保留），
+/// 也收写法说得清是哪天的日期（[`written_date`]），换成规则 3 的样子；bool 宽容 yes/no。
 pub fn normalize_attr_value(datatype: &str, raw: &serde_json::Value) -> Option<serde_json::Value> {
     match datatype {
         "number" => match raw {
-            serde_json::Value::Number(n) => Some(serde_json::Value::Number(n.clone())),
+            // 模型给的 JSON 数也过一遍 f64：`65` 与 "65%" 解出来的 `65.0` 是同一个数，
+            // 而 serde_json 把整数和浮点当两种值——实测同一条边上 65 撞 65.0 记成了冲突
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .filter(|f| f.is_finite())
+                .and_then(serde_json::Number::from_f64)
+                .map(serde_json::Value::Number),
             serde_json::Value::String(s) => {
+                // 「约350名」：约数的那个字挡在数前面，宽的那套也解不动
+                let s = strip_approx(s);
                 let cleaned: String = s
                     .chars()
                     .filter(|c| !matches!(c, ',' | ' ' | '_'))
@@ -558,15 +685,32 @@ pub fn normalize_attr_value(datatype: &str, raw: &serde_json::Value) -> Option<s
                 cleaned
                     .parse::<f64>()
                     .ok()
+                    // 清洗解不动的再当量解：`$5 billion`、`52%` 这些整体就是数，
+                    // 只是带着符号与量级词。单位不在这里落笔——它随事实走
+                    // （见 `parse_quantity`），这一档只负责把值变成可比的数
+                    // 清洗解不动的再当量解。**这一档已经声明了 datatype = number**，
+                    // 问的不是「是不是数」而是「那个数是多少」，所以用宽的那套：
+                    // `$5 billion` → 5e9，`1,250 people` → 1250，
+                    // `42% from customers in Europe` → 42
+                    .or_else(|| parse_leading_quantity(s).map(|(n, _)| n))
                     .filter(|f| f.is_finite())
                     .and_then(serde_json::Number::from_f64)
                     .map(serde_json::Value::Number)
             }
             _ => None,
         },
+        // 按规则 3 写的原样留着（精度随写了几位，带时区的时刻也在内）；写成别的样子、又读得
+        // 出来的日期（#688）换成规则 3 的样子——同一天只该有一种写法，比较和去重才对得上
         "date" => {
             let s = raw.as_str()?.trim();
-            parse_time(s).map(|_| serde_json::Value::String(s.to_string()))
+            match written_date(s) {
+                Some((date, precision)) => Some(serde_json::Value::String(match precision {
+                    "year" => date.format("%Y").to_string(),
+                    "month" => date.format("%Y-%m").to_string(),
+                    _ => date.format("%Y-%m-%d").to_string(),
+                })),
+                None => parse_time(s).map(|_| serde_json::Value::String(s.to_string())),
+            }
         }
         "bool" => match raw {
             serde_json::Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
@@ -588,11 +732,78 @@ pub fn normalize_attr_value(datatype: &str, raw: &serde_json::Value) -> Option<s
     }
 }
 
-/// 解析时间字符串 → (UTC 时间, 精度)。支持 YYYY / YYYY-MM / YYYY-MM-DD。
+/// 一条开放陈述的值落到一个属性上：按属性的 datatype 归一，数再换算到属性声明的单位。
+///
+/// 单位只换量级：属性写「万元」、原文写「2.3亿元」，存 23000；原文写「5000」这样光
+/// 秃秃的数，就当它已经是声明的单位。原文的货币和声明的货币对不上（「5000万美元」落到
+/// 「万元」上）返回 None——换汇是一条没人负责的断言。读不出来的也是 None：宁缺勿脏，
+/// 陈述留在开放图谱里，不把「约350名」这样的字当成一个数写进类型化图谱
+pub fn attribute_value(
+    datatype: &str,
+    unit: Option<&str>,
+    raw: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let declared = unit.map(str::trim).filter(|u| !u.is_empty());
+    let read = match (raw, datatype, declared) {
+        (serde_json::Value::String(s), "number", Some(d)) => {
+            scan_quantity(strip_approx(s), false).map(|q| (q, d))
+        }
+        _ => None,
+    };
+    let Some((q, declared)) = read else {
+        return normalize_attr_value(datatype, raw);
+    };
+    // 声明的单位拆成量级和其余：「万元」→ (4, 元)，「million dollars」→ (6, dollars)
+    let (tok, rest) = next_token(declared);
+    let (exponent, base) = match magnitude(&tok.to_ascii_lowercase()) {
+        Some(m) => (m, rest.trim()),
+        None => (0, declared),
+    };
+    let written = q.unit.as_deref().and_then(currency_unit);
+    let wanted = currency_unit(base);
+    if written.is_some() && wanted.is_some() && written != wanted {
+        return None;
+    }
+    // 原文写了量级词，或写了和声明一样的单位（「50000000元」对「万元」），n 才是绝对量，
+    // 要除下来；光秃秃的数就是声明单位下的数。除法走一次十进制解析，同 `scan_quantity`
+    // 乘量级词的道理：先算成 f64 再除会留下 23000.000000000004
+    let n = if q.scaled || (written.is_some() && written == wanted) {
+        format!("{}e-{exponent}", q.n).parse().ok()?
+    } else {
+        q.n
+    };
+    serde_json::Number::from_f64(n).map(serde_json::Value::Number)
+}
+
+/// 解析时间字符串 → (UTC 时间, 精度)。
+///
+/// 日期：YYYY / YYYY-MM / YYYY-MM-DD，精度随写了几位。带时区的时刻（0024）：
+/// `YYYY-MM-DDTHH[:MM[:SS]]` 后跟 `Z` 或 `±HH:MM`，精度到 hour / minute / second，
+/// 值截到那一位。**没有时区的钟点不是时刻**——「14:32」是哪里的 14:32 没人知道——
+/// 所以只取日期那一半，按天；钟点留在引文里。亚秒一律丢：账本到秒为止。
+///
+/// 这是规则 3 的契约格式，工具参数、界面上的时刻都只认它。读模型回复用 [`read_time`]
 pub fn parse_time(s: &str) -> Option<(DateTime<Utc>, &'static str)> {
     let s = s.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("null") {
         return None;
+    }
+    if let Some((date, clock)) = s.split_once(['T', ' ']) {
+        let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        let Some((clock, offset)) = split_zone(clock) else {
+            return Some((Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?), "day"));
+        };
+        let parts: Vec<&str> = clock.split(':').collect();
+        let (h, m, sec, precision) = match parts.as_slice() {
+            [h] => (*h, "0", "0", "hour"),
+            [h, m] => (*h, *m, "0", "minute"),
+            [h, m, sec] => (*h, *m, sec.split('.').next().unwrap_or(sec), "second"),
+            _ => return None,
+        };
+        let time =
+            chrono::NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?)?;
+        let utc = d.and_time(time) - offset;
+        return Some((Utc.from_utc_datetime(&utc), precision));
     }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some((Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?), "day"));
@@ -609,151 +820,501 @@ pub fn parse_time(s: &str) -> Option<(DateTime<Utc>, &'static str)> {
     None
 }
 
-#[cfg(test)]
-mod prompt_shape_tests {
-    use super::*;
+/// 读模型回复里的时间：先按规则 3（[`parse_time`]）；没照它写、但写法说得清是哪天的日期
+/// 也收（[`written_date`]，#688）。区间端点、日期属性、边上的日期属性都从这里读
+pub fn read_time(s: &str) -> Option<(DateTime<Utc>, &'static str)> {
+    parse_time(s).or_else(|| {
+        let (date, precision) = written_date(s)?;
+        Some((
+            Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0)?),
+            precision,
+        ))
+    })
+}
 
-    fn rel(key: &str, description: &str, signature: &str) -> PromptRelation {
-        PromptRelation {
-            key: key.into(),
-            label: key.replace('_', " "),
-            description: description.into(),
-            signature: signature.into(),
+/// 没照规则 3 写、但说得清是哪一天（或哪个月）的日期（#688）。
+///
+/// 合同、公告里的日期多半这么写，模型常常照抄；从前这些值全被当成「不是日期」丢掉。
+/// 收两类，精度随写了几位——只写到月的就是月，不替它补一个日：
+/// - 月份写成名字的：`March 17, 2020`、`17 March 2020`、`Mar. 17 2020`、`March 2020`。
+///   名字由 chrono 的 `%B` / `%b` 认（整名或三个字母的缩写，不分大小写）
+/// - 年在前的数字：`2020/03/17`、`2020.3.17`、`2020年3月17日`、`2020年3月`
+///
+/// **日、月都是数字而年不在前的不收**：`03/04/2020` 是三月四日还是四月三日，写法本身说
+/// 不清，猜错一次就是一个错的截止日。
+pub fn written_date(s: &str) -> Option<(NaiveDate, &'static str)> {
+    let s = s.trim();
+    if let Some(found) = year_first_date(s) {
+        return found;
+    }
+    // 月份写成名字的：句点（缩写后面那个）与逗号只是标点
+    let words: Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '.')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let is_number = |w: &str| w.chars().all(|c| c.is_ascii_digit());
+    let (day, month, year) = match words.as_slice() {
+        [m, d, y] if !is_number(m) && is_number(d) && is_number(y) => (Some(*d), *m, *y),
+        [d, m, y] if is_number(d) && !is_number(m) && is_number(y) => (Some(*d), *m, *y),
+        [m, y] if !is_number(m) && is_number(y) => (None, *m, *y),
+        _ => return None,
+    };
+    if year.len() != 4 || day.is_some_and(|d| d.len() > 2) {
+        return None;
+    }
+    let month = ["%B", "%b"].iter().find_map(|f| {
+        NaiveDate::parse_from_str(&format!("1 {month} 2000"), &format!("%d {f} %Y"))
+            .ok()
+            .map(|d| chrono::Datelike::month(&d))
+    })?;
+    let year = year.parse().ok()?;
+    match day {
+        Some(d) => NaiveDate::from_ymd_opt(year, month, d.parse().ok()?).map(|date| (date, "day")),
+        None => NaiveDate::from_ymd_opt(year, month, 1).map(|date| (date, "month")),
+    }
+}
+
+/// 年在前的数字日期。外层 `None` = 不是这种写法，交给下一种；`Some(None)` = 是这种写法
+/// 但不是真实的日子
+fn year_first_date(s: &str) -> Option<Option<(NaiveDate, &'static str)>> {
+    let marked = s.contains('年');
+    let separated = s.contains(['/', '.']) && !s.contains(char::is_whitespace);
+    if !marked && !separated {
+        return None;
+    }
+    let parts: Vec<&str> = s
+        .trim_end_matches('日')
+        .split(['/', '.', '年', '月'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if parts.first().is_none_or(|y| y.len() != 4) {
+        // 年不在前：日月顺序说不清，不交给别的写法去猜
+        return Some(None);
+    }
+    let number = |p: &str| p.parse::<u32>().ok();
+    let year = parts[0].parse::<i32>().ok()?;
+    Some(match parts[1..] {
+        [m, d] if m.len() <= 2 && d.len() <= 2 => {
+            NaiveDate::from_ymd_opt(year, number(m)?, number(d)?).map(|date| (date, "day"))
         }
-    }
+        // 只到月：写了「年」「月」才算（`2020/03` 太像别的东西）
+        [m] if marked && s.ends_with('月') && m.len() <= 2 => {
+            NaiveDate::from_ymd_opt(year, number(m)?, 1).map(|date| (date, "month"))
+        }
+        // 只到年：「1982年」。写了「年」才算，光秃秃的 `1982` 归 parse_time
+        [] if marked && s.ends_with('年') => {
+            NaiveDate::from_ymd_opt(year, 1, 1).map(|date| (date, "year"))
+        }
+        _ => None,
+    })
+}
 
-    /// 签名进括号，而且**一律是 key**：中文库的 label 是"人物"，
-    /// 写进提示词等于教模型输出一个不存在的类型。
-    #[test]
-    fn a_signature_takes_the_parenthesis_and_uses_keys() {
-        let rels = vec![rel("works_at", "受雇于某个组织。", "person → organization")];
-        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
-        assert!(msgs[0]
-            .content
-            .contains("- works_at (person → organization): 受雇于某个组织。"));
+/// 钟点后面的时区：`Z` 或 `±HH[:]MM` / `±HH`。返回 (钟点, 相对 UTC 的偏移)；
+/// 没有时区返回 None——调用方据此只记那一天
+fn split_zone(clock: &str) -> Option<(&str, chrono::Duration)> {
+    if let Some(c) = clock.strip_suffix(['Z', 'z']) {
+        return Some((c, chrono::Duration::zero()));
     }
-
-    /// 多值用 `|`，空的一侧用 `*` —— 都是 key 层面的记号，不是类型名
-    #[test]
-    fn several_classes_join_with_a_pipe_and_an_empty_side_is_a_star() {
-        let rels = vec![rel("buys_from", "", "employee|team → *")];
-        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
-        assert!(msgs[0].content.contains("- buys_from (employee|team → *)"));
-    }
-
-    /// **没有签名的库，提示词一字不变**：记号说明也不出现。
-    /// 大多数库不会声明 domain/range，不该为此付每块的 token
-    #[test]
-    fn a_base_without_signatures_pays_nothing() {
-        let rels = vec![rel("works_at", "受雇于某个组织。", "")];
-        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
-        assert!(msgs[0].content.contains("- works_at: 受雇于某个组织。"));
-        assert!(!msgs[0].content.contains("type signature"));
-        assert!(!msgs[0].content.contains('→'));
-    }
-
-    /// 签名是提示不是闸门。这句话必须在提示词里 —— 少了它，
-    /// 模型会把签名当硬规则，本体写错时就系统性丢数据（part_of 那种方式）
-    #[test]
-    fn the_prompt_says_the_signature_is_a_hint() {
-        let rels = vec![rel("works_at", "d", "person → organization")];
-        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
-        assert!(msgs[0].content.contains("hint, not a rule"));
-    }
-
-    /// **但顺序不是提示。**
-    ///
-    /// 两句话必须同时在场，少哪一句都退回一种老毛病：少了「提示不是闸门」，
-    /// 本体写错时系统性丢数据（part_of 那种方式）；少了「顺序由签名定」，
-    /// 模型按英语直觉写 `Musk --employee--> Microsoft`，而 schema.org 声明的是
-    /// `employee (organization → person)`——实测一次跑里 130 条可校验的事实
-    /// 有 102 条这样反着落库。
-    #[test]
-    fn the_prompt_says_the_order_is_not_a_hint() {
-        let rels = vec![rel("employee", "d", "organization → person")];
-        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
-        let c = &msgs[0].content;
-        assert!(c.contains("hint, not a rule"), "类型那句丢了");
-        assert!(c.contains("The order is not a hint"), "顺序那句丢了");
-        assert!(
-            c.contains("swap subject and object"),
-            "只说了顺序重要，没说反着写时该怎么办"
-        );
-        assert!(
-            c.contains("do not reverse the relation"),
-            "少了这句，模型可能去找一个反向关系而不是交换主宾"
-        );
-    }
-
-    /// 已知实体必须落在 **user** 消息里、紧挨着正文。
-    ///
-    /// 理由是服从性不是缓存：抽象规则打不过挨着它的具体块。清单放进 system 的
-    /// 规则区，就会隔着输出格式、十条规则、文件名，离它要管的正文最远。
-    #[test]
-    fn known_entities_stay_out_of_the_system_message() {
-        // 用一个规则 1 的例子里没有的名字：规则 1 也提"星云科技上海研究院"，
-        // 拿它断言等于测不出清单到底在哪条消息里
-        let known = vec![(
-            "organization".to_string(),
-            "华瑞集团智能制造研究院".to_string(),
-        )];
-        let msgs = build_messages(&[], &[], &[], None, "a.txt", &known, "text");
-        assert_eq!(msgs[0].role, "system");
-        assert!(!msgs[0].content.contains("Already recorded"));
-        assert!(!msgs[0].content.contains("华瑞集团智能制造研究院"));
-        assert!(msgs[1]
-            .content
-            .contains("organization: 华瑞集团智能制造研究院"));
-    }
-
-    /// 第一块没有"前面"，那一段应当完全不出现——成本为零，而不是一段空标题
-    #[test]
-    fn the_first_chunk_carries_no_block() {
-        let msgs = build_messages(&[], &[], &[], None, "a.txt", &[], "text");
-        assert!(!msgs[1].content.contains("Already recorded"));
-    }
-
-    /// 反向护栏必须在：给了参照物就会有人硬套（`concept` 那次的教训）
-    #[test]
-    fn the_block_tells_the_model_not_to_force_a_match() {
-        let known = vec![("person".to_string(), "陈立".to_string())];
-        let msgs = build_messages(&[], &[], &[], None, "a.txt", &known, "text");
-        assert!(msgs[1].content.contains("do not force it onto this list"));
-    }
-
-    /// 有描述就不送 label——中文库的 label 是中文，混进提示词只会让
-    /// 标识符与语料语言来回跳，而它相对 key 近乎零信息量。
-    #[test]
-    fn described_types_drop_the_label() {
-        let types = vec![
-            (
-                "person".into(),
-                "人物".into(),
-                "有名有姓的具体的人。".into(),
-            ),
-            ("event".into(), "事件".into(), String::new()),
-        ];
-        let msgs = build_messages(&types, &[], &[], None, "a.txt", &[], "text");
-        let prompt = format!("{:?}", msgs);
-        assert!(prompt.contains("- person: 有名有姓的具体的人。"));
-        assert!(!prompt.contains("person (人物)"));
-        // 描述为空时 label 仍是唯一的额外线索，留着
-        assert!(prompt.contains("- event (事件)"));
-    }
+    let i = clock.rfind(['+', '-'])?;
+    let (c, zone) = clock.split_at(i);
+    let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
+    let digits: String = zone[1..].chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let (hh, mm) = match digits.len() {
+        2 => (&digits[..2], "0"),
+        4 => (&digits[..2], &digits[2..]),
+        _ => return None,
+    };
+    let (h, m): (i64, i64) = (hh.parse().ok()?, mm.parse().ok()?);
+    Some((c, chrono::Duration::minutes(sign * (h * 60 + m))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// #690：思考过程里的大括号不能把 JSON 的起止带偏。不切掉标记，"第一个 `{`" 的起点
+    /// 会提前到思考过程里；代码围栏与前后的废话同样不算数
+    #[test]
+    fn json_block_ignores_a_think_block_and_a_fence_before_the_json() {
+        let raw = "先想想 {\"a\": 1，再回答。\n</think>{\"entities\":[{\"name\":\"张三\"}]}";
+        assert_eq!(
+            json_block(raw).unwrap(),
+            "{\"entities\":[{\"name\":\"张三\"}]}"
+        );
+        let fenced = "好的，结果如下：\n```json\n{\"entities\":[]}\n```";
+        assert_eq!(json_block(fenced).unwrap(), "{\"entities\":[]}");
+        assert!(json_block("no json here").is_err());
+    }
+
+    /// 括号出现在字符串里不算结构——`"a[b"` 不是一个开括号；断在字符串中间的那一截不可用
+    #[test]
+    fn brackets_inside_strings_are_not_structure() {
+        assert_eq!(
+            close_brackets(r#"{"s": [{"a": "a[b{c"}"#).as_deref(),
+            Some(r#"{"s": [{"a": "a[b{c"}]}"#)
+        );
+        assert!(close_brackets(r#"{"s": "cut in the mid"#).is_none());
+        assert!(close_brackets("]").is_none());
+    }
+
+    #[test]
+    fn a_long_opening_is_cut_on_a_character_boundary() {
+        let long = "租".repeat(OPENING_BUDGET_CHARS + 10);
+        let block = opening_block(Some(&long));
+        assert_eq!(block.matches('租').count(), OPENING_BUDGET_CHARS);
+        assert!(block.contains(" …"));
+        assert_eq!(opening_block(Some("   ")), "");
+    }
+
+    #[test]
+    fn written_magnitudes_preserve_fractional_values() {
+        for (input, expected) in [
+            ("1.00000025 million", 1000000.25),
+            ("100.000025万", 1000000.25),
+            ("-1.00000025 million", -1000000.25),
+            ("+100.000025万", 1000000.25),
+            ("9.2亿", 920000000.0),
+            ("0.00000000025 thousand", 0.00000025),
+            ("0 million", 0.0),
+            ("1,000.00025 thousand", 1000000.25),
+        ] {
+            assert_eq!(parse_quantity(input), Some((expected, None)), "{input}");
+            assert_eq!(
+                parse_leading_quantity(input),
+                Some((expected, None)),
+                "{input}"
+            );
+            assert_eq!(
+                normalize_attr_value("number", &serde_json::json!(input)),
+                Some(serde_json::json!(expected)),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            parse_quantity("$1.00000025 million"),
+            Some((1000000.25, Some("$".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("1.00000025 million people worldwide"),
+            Some((1000000.25, Some("people".into())))
+        );
+        for rejected in [
+            "3M",
+            "5k",
+            "1e3 million",
+            "1.2.3 million",
+            "--1 million",
+            "1 million people",
+        ] {
+            assert_eq!(parse_quantity(rejected), None, "{rejected}");
+        }
+        assert_eq!(
+            parse_quantity(&format!("{} trillion", "9".repeat(400))),
+            None
+        );
+        assert_eq!(
+            parse_quantity(&format!("{}1.00000025 million", "0".repeat(20_000))),
+            Some((1000000.25, None))
+        );
+    }
+
+    #[test]
+    fn written_magnitudes_match_integer_decimal_oracles() {
+        // The oracle shifts exact u128 integers, then parses an ordinary decimal.
+        // No float multiplication or epsilon can erase a meaningful remainder.
+        for (word, exponent) in [
+            ("thousand", 3),
+            ("万", 4),
+            ("million", 6),
+            ("千万", 7),
+            ("亿", 8),
+            ("billion", 9),
+            ("trillion", 12),
+        ] {
+            for coefficient in [0u128, 1, 25, 100000025, 9200000000, 9007199254740991] {
+                for places in 0..=15u32 {
+                    let divisor = 10u128.pow(places);
+                    let expanded = coefficient * 10u128.pow(exponent);
+                    let decimal = |n: u128| {
+                        if places == 0 {
+                            n.to_string()
+                        } else {
+                            format!(
+                                "{}.{:0width$}",
+                                n / divisor,
+                                n % divisor,
+                                width = places as usize
+                            )
+                        }
+                    };
+                    for sign in ["", "-"] {
+                        let input = format!("{sign}{} {word}", decimal(coefficient));
+                        let expected: f64 = format!("{sign}{}", decimal(expanded)).parse().unwrap();
+                        assert_eq!(parse_quantity(&input), Some((expected, None)), "{input}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_quantity_is_the_whole_string_or_nothing() {
+        // 整体就是一个量：符号、量级词、千分位都读得动
+        assert_eq!(parse_quantity("$5 billion"), Some((5e9, Some("$".into()))));
+        assert_eq!(
+            parse_quantity("€1.5 million"),
+            Some((1.5e6, Some("€".into())))
+        );
+        assert_eq!(parse_quantity("52%"), Some((52.0, Some("%".into()))));
+        assert_eq!(parse_quantity("3.5 million"), Some((3.5e6, None)));
+        assert_eq!(parse_quantity("35,000"), Some((35000.0, None)));
+        assert_eq!(parse_quantity("  42 "), Some((42.0, None)));
+        // 币种：符号、ISO 码、中英文单词，统一成符号；量级：英文全写与中文千万亿
+        assert_eq!(
+            parse_quantity("EUR 30 million"),
+            Some((3e7, Some("€".into())))
+        );
+        assert_eq!(
+            parse_quantity("30 million euros"),
+            Some((3e7, Some("€".into())))
+        );
+        assert_eq!(
+            parse_quantity("USD 5 billion"),
+            Some((5e9, Some("$".into())))
+        );
+        assert_eq!(parse_quantity("2亿美元"), Some((2e8, Some("$".into()))));
+        assert_eq!(
+            parse_quantity("15亿元人民币"),
+            Some((1.5e9, Some("¥".into())))
+        );
+        assert_eq!(parse_quantity("3000万元"), Some((3e7, Some("¥".into()))));
+        assert_eq!(parse_quantity("1.5亿"), Some((1.5e8, None)));
+        // 乘过量级的数收成整数：9.2 亿不是 919999999.9999999
+        assert_eq!(
+            parse_quantity("9.2亿元"),
+            Some((920000000.0, Some("¥".into())))
+        );
+        assert_eq!(
+            parse_quantity("$2.5 billion"),
+            Some((2500000000.0, Some("$".into())))
+        );
+
+        // 尾巴上还有实词：含义不再只是那个数，宁可当实体也不当量
+        assert_eq!(parse_quantity("900 million weekly active users"), None);
+        assert_eq!(parse_quantity("2025 Atlantic hurricane season"), None);
+        assert_eq!(parse_quantity("$10 billion investment"), None);
+        assert_eq!(parse_quantity("8GW data center"), None);
+        // 单字母后缀不认：3M 是一家公司，读成三百万就把一个真实体吃掉了
+        assert_eq!(parse_quantity("3M"), None);
+        assert_eq!(parse_quantity("5k"), None);
+        // 两个记号撞一起，不是量
+        assert_eq!(parse_quantity("$5%"), None);
+        assert_eq!(parse_quantity(""), None);
+        assert_eq!(parse_quantity("杭州"), None);
+    }
+
+    #[test]
+    fn a_declared_number_reads_past_the_unit() {
+        // 属性已经声明了 datatype = number，问的是「那个数是多少」。
+        // 卡住过的两条都在这里
+        assert_eq!(
+            parse_leading_quantity("1,250 people"),
+            Some((1250.0, Some("people".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("42% from customers in Europe"),
+            Some((42.0, Some("%".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("3,400 people worldwide"),
+            Some((3400.0, Some("people".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("900 million weekly active users"),
+            Some((9e8, Some("weekly".into())))
+        );
+        // 整体就是量的仍走严的那套：单位是 `$`，不是 `billion`
+        assert_eq!(
+            parse_leading_quantity("$5 billion"),
+            Some((5e9, Some("$".into())))
+        );
+        // 开头不是数就还是不认
+        // 币种在尾巴上也认；认不出的词才落到「单位是第一个词」
+        assert_eq!(
+            parse_leading_quantity("30 million euros in cash"),
+            Some((3e7, Some("€".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("15亿元人民币的投资"),
+            Some((1.5e9, Some("¥".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("30 million francs"),
+            Some((3e7, Some("francs".into())))
+        );
+        assert_eq!(parse_leading_quantity("about ten"), None);
+        assert_eq!(parse_leading_quantity(""), None);
+
+        // **严的那套一点没松**：它要判「是不是一个东西」，判错会吃掉真实体
+        assert_eq!(parse_quantity("1,250 people"), None);
+        assert_eq!(parse_quantity("2025 Atlantic hurricane season"), None);
+    }
+
+    #[test]
+    fn a_number_attribute_takes_a_written_quantity() {
+        use serde_json::json;
+        // 采纳属性时按 datatype 换算，量也要换得动——否则 `$5 billion`
+        // 会一路「换不动」，事实永远拿不到谓词
+        assert_eq!(
+            normalize_attr_value("number", &json!("$5 billion")),
+            Some(json!(5e9))
+        );
+        assert_eq!(
+            normalize_attr_value("number", &json!("52%")),
+            Some(json!(52.0))
+        );
+        // 原来就认的两种写法不受影响
+        assert_eq!(
+            normalize_attr_value("number", &json!("35,000")),
+            Some(json!(35000.0))
+        );
+        assert_eq!(normalize_attr_value("number", &json!("about ten")), None);
+    }
+
     #[test]
     fn parse_time_precisions() {
         assert_eq!(parse_time("2024").unwrap().1, "year");
         assert_eq!(parse_time("2024-07").unwrap().1, "month");
         assert_eq!(parse_time("2024-07-15").unwrap().1, "day");
+        // 带时区的钟点：到分、到时、到秒，值截到那一位，偏移换回 UTC
+        let (t, p) = parse_time("2026-06-01T14:32Z").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T14:32:00+00:00".to_string(), "minute")
+        );
+        assert_eq!(parse_time("2026-06-01T14Z").unwrap().1, "hour");
+        let (t, p) = parse_time("2026-06-01T14:32:07.382+08:00").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T06:32:07+00:00".to_string(), "second")
+        );
+        // 没时区的钟点不是时刻：只记那一天
+        let (t, p) = parse_time("2026-06-01T14:32").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T00:00:00+00:00".to_string(), "day")
+        );
         assert!(parse_time("null").is_none());
         assert!(parse_time("").is_none());
         assert!(parse_time("下个月").is_none());
+        // 契约格式之外的写法不归它：工具参数里的「August 2024」不猜
+        assert!(parse_time("June 23, 2020").is_none());
+        // 读模型回复的那一个收写出来的日期（#688），精度随写了几位
+        let (t, p) = read_time("June 23, 2020").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2020-06-23T00:00:00+00:00".to_string(), "day")
+        );
+        assert_eq!(read_time("March 2020").unwrap().1, "month");
+        assert_eq!(read_time("2024-07").unwrap().1, "month");
+        assert!(read_time("03/04/2020").is_none());
+    }
+
+    /// 合同与公告里的日期写法（#688）：说得清是哪天的都收成规则 3 的样子，说不清的不猜
+    #[test]
+    fn a_written_date_is_read_only_when_its_form_says_which_day() {
+        use serde_json::json;
+        let day = |s: &str| normalize_attr_value("date", &json!(s));
+        for written in [
+            "March 17, 2020",
+            "March 17 2020",
+            "march 17, 2020",
+            "MARCH 17, 2020",
+            "Mar 17, 2020",
+            "Mar. 17, 2020",
+            "17 March 2020",
+            "17 Mar. 2020",
+            "17 March, 2020",
+            "  March 17, 2020 ",
+            "2020/03/17",
+            "2020.3.17",
+            "2020年3月17日",
+        ] {
+            assert_eq!(day(written), Some(json!("2020-03-17")), "{written}");
+        }
+        // 只写到月的是月，不补日
+        for written in ["March 2020", "Mar. 2020", "2020年3月"] {
+            assert_eq!(day(written), Some(json!("2020-03")), "{written}");
+        }
+        // 已经照规则 3 写的原样留着
+        assert_eq!(day("2020-03-17"), Some(json!("2020-03-17")));
+        assert_eq!(day("2020"), Some(json!("2020")));
+        // 日月都是数字、年不在前：说不清是几月几号
+        for ambiguous in ["03/04/2020", "3.4.2020", "04-03-2020", "3/4/20"] {
+            assert_eq!(day(ambiguous), None, "{ambiguous}");
+        }
+        // 不是日期，或不是一个真实的日子
+        for not_a_date in [
+            "45 days after the Trigger Date",
+            "Q3 2020",
+            "Sometime 2020",
+            "February 30, 2020",
+            "March 17, 20",
+            "March 123, 2020",
+            "2020/13/01",
+            "2020/03",
+            "next March",
+        ] {
+            assert_eq!(day(not_a_date), None, "{not_a_date}");
+        }
+        // 区间端点读的是同一个解析
+        assert_eq!(
+            read_time("17 Mar 2020").map(|(t, p)| (t.date_naive().to_string(), p)),
+            Some(("2020-03-17".to_string(), "day"))
+        );
+    }
+
+    #[test]
+    fn a_similarity_proposed_pair_says_so_in_the_prompt() {
+        let side = |name: &str| AdjudicationSide {
+            name: name.into(),
+            type_label: "person".into(),
+            facts: vec![],
+        };
+        let pairs = vec![
+            AdjudicationPair {
+                left: side("张伟"),
+                right: side("财务部总监张伟"),
+                precedents: vec![],
+                proposed_because: proposed_because(Some("0.78")),
+            },
+            AdjudicationPair {
+                left: side("张伟"),
+                right: side("张伟"),
+                precedents: vec![],
+                proposed_because: proposed_because(None),
+            },
+        ];
+        let user = &build_adjudication_messages(&pairs)[1].content;
+        let first = &user[..user.find("Pair 1:").unwrap()];
+        let second = &user[user.find("Pair 1:").unwrap()..];
+        assert!(
+            first.contains("Why paired:") && first.contains("cosine 0.78"),
+            "{first}"
+        );
+        assert!(
+            !second.contains("Why paired:"),
+            "同名对不该带这一行：{second}"
+        );
+    }
+
+    #[test]
+    fn a_proposal_note_needs_a_cosine() {
+        assert!(proposed_because(Some("0.62")).is_some());
+        assert!(proposed_because(None).is_none());
     }
 
     #[test]
@@ -765,6 +1326,57 @@ mod tests {
         assert_eq!(v[1].confidence, None);
     }
 
+    /// 形状好的回复不算修补过，裁决与 `parse_adjudication` 一字不差
+    #[test]
+    fn a_well_formed_reply_is_not_repaired() {
+        let raw = "{\"verdicts\":[{\"i\":0,\"verdict\":\"same\",\"confidence\":0.92,\"why\":\"one line\"}]}";
+        let (v, repaired) = parse_adjudication_repairing(raw).unwrap();
+        assert!(!repaired);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].why.as_deref(), Some("one line"));
+        assert_eq!(v[0].confidence, Some(0.92));
+        let plain = parse_adjudication(raw).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].why, v[0].why);
+    }
+
+    /// 模型在引号里的理由中间直接换行（gemini-3.5-flash 经网关就这么写）：
+    /// serde 报 control character；修补后整批照读，换行留在理由里，标记修补过
+    #[test]
+    fn a_raw_newline_inside_a_reason_string_is_repaired() {
+        let raw = "```json\n{\"verdicts\":[\n  {\"i\":0,\"verdict\":\"different\",\"confidence\":0.9,\n   \"reason\":\"Rule 2: a version is not the series.\nRecord A is Claude 3, Record B is the family.\",\n   \"why\":\"a version\nis not the series\"},\n  {\"i\":1,\"verdict\":\"same\",\"confidence\":0.8,\"why\":\"tab\there\"}\n]}\n```";
+        assert!(parse_adjudication_repairing(
+            "{\"verdicts\":[{\"i\":0,\"verdict\":\"same\",\"why\":\"a\""
+        )
+        .is_err());
+        let (v, repaired) = parse_adjudication_repairing(raw).unwrap();
+        assert!(repaired);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].verdict, "different");
+        assert_eq!(v[0].why.as_deref(), Some("a version\nis not the series"));
+        assert_eq!(v[1].why.as_deref(), Some("tab\there"));
+        // 直接走 `parse_adjudication` 也一样读得出来
+        assert_eq!(parse_adjudication(raw).unwrap().len(), 2);
+    }
+
+    /// 转义只碰字符串里的：引号外的换行是合法空白；`\"` 不结束字符串；已转义的 `\\n` 不动
+    #[test]
+    fn only_control_characters_inside_strings_are_escaped() {
+        let text =
+            "{\n  \"a\": \"x\ny\",\n  \"b\": \"q\\\"\nz\",\n  \"c\": \"already\\nescaped\"\n}";
+        let fixed = escape_control_in_strings(text);
+        assert_eq!(
+            fixed,
+            "{\n  \"a\": \"x\\ny\",\n  \"b\": \"q\\\"\\nz\",\n  \"c\": \"already\\nescaped\"\n}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(v["a"], "x\ny");
+        assert_eq!(v["b"], "q\"\nz");
+        assert_eq!(v["c"], "already\nescaped");
+        let clean = "{\"a\": \"fine\"}";
+        assert_eq!(escape_control_in_strings(clean), clean);
+    }
+
     #[test]
     fn normalize_attr_values() {
         use serde_json::json;
@@ -772,7 +1384,11 @@ mod tests {
             normalize_attr_value("number", &json!("35,000")),
             Some(json!(35000.0))
         );
-        assert_eq!(normalize_attr_value("number", &json!(42)), Some(json!(42)));
+        // JSON 里的整数也落成同一种数：`42` 与 "42" 解出来是同一个值
+        assert_eq!(
+            normalize_attr_value("number", &json!(42)),
+            Some(json!(42.0))
+        );
         assert_eq!(normalize_attr_value("number", &json!("about ten")), None);
         assert_eq!(
             normalize_attr_value("date", &json!("2024-07")),
@@ -789,84 +1405,87 @@ mod tests {
         );
         assert_eq!(normalize_attr_value("text", &json!([1])), None);
     }
+}
 
-    /// **一条坏记录不该毁掉一整块。**
-    ///
-    /// 形态取自真实日志：`missing field \`predicate\``。模型偶尔会漏写这个字段
-    /// （`related_to` 退场后它没有万能选项可挑），从前 serde 会让整块作废，
-    /// 而这一块里另外两条事实是好的。
+#[cfg(test)]
+mod a_number_is_one_number {
+    use super::normalize_attr_value;
+    use serde_json::json;
+
+    /// 模型写 `65` 还是 "65%"，落下来都是同一个数——不然同一条边上会记成冲突
     #[test]
-    fn one_malformed_fact_does_not_take_the_whole_chunk() {
-        let raw = r#"{
-          "entities": [{"name": "OpenAI", "type": "organization"}],
-          "facts": [
-            {"subject": "OpenAI", "predicate": "produces", "object": "GPT-4"},
-            {"subject": "OpenAI", "object": "ChatGPT"},
-            {"subject": "Sam Altman", "predicate": "leads", "object": "OpenAI"}
-          ]
-        }"#;
-        let x = parse_response(raw).unwrap();
-        assert_eq!(x.facts.len(), 2, "好的两条该留下");
-        assert_eq!(x.skipped_facts, 1, "跳过的那条要报出来，不能静默");
-        assert_eq!(x.entities.len(), 1);
-        assert!(!x.truncated);
+    fn a_number_is_one_number_however_it_is_written() {
+        let a = normalize_attr_value("number", &json!(65)).unwrap();
+        let b = normalize_attr_value("number", &json!("65%")).unwrap();
+        let c = normalize_attr_value("number", &json!("65")).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a.as_f64(), Some(65.0));
+    }
+}
+
+#[cfg(test)]
+mod an_attribute_value_is_read_in_its_declared_unit {
+    use super::{attribute_value, literal_object};
+    use serde_json::json;
+
+    fn value(datatype: &str, unit: Option<&str>, raw: &str) -> Option<serde_json::Value> {
+        attribute_value(datatype, unit, &json!(raw))
     }
 
-    /// **输出被截断时，已经完整的那些要救回来。**
-    ///
-    /// 撞上 max_tokens 时模型写到一半就没了（真实日志：`EOF while parsing a list`）。
-    /// 前面的对象是完整且正确的，整块作废等于把抽对的十几条一起扔掉。
+    /// 公司简介里最平常的几句：值照原文写，落到属性上要是那个数、那一天
     #[test]
-    fn a_cut_off_reply_keeps_what_was_complete() {
-        let raw = r#"{
-          "entities": [{"name": "Anthropic", "type": "organization"}],
-          "facts": [
-            {"subject": "Anthropic", "predicate": "produces", "object": "Claude"},
-            {"subject": "Dario Amodei", "predicate": "leads", "object": "Anthropic"},
-            {"subject": "Anthropic", "predicate": "loca"#;
-        let x = parse_response(raw).unwrap();
-        assert!(x.truncated, "截断要标出来");
-        assert_eq!(x.facts.len(), 2, "断点之前的两条是完整的");
-        assert_eq!(x.entities.len(), 1);
+    fn plain_company_figures_are_read() {
+        assert_eq!(
+            value("number", Some("万元"), "5000万元"),
+            Some(json!(5000.0))
+        );
+        assert_eq!(
+            value("number", Some("万元"), "2.3亿元"),
+            Some(json!(23000.0))
+        );
+        assert_eq!(value("number", Some("亿元"), "8.6亿元"), Some(json!(8.6)));
+        assert_eq!(
+            value("number", Some("万元"), "50000000元"),
+            Some(json!(5000.0))
+        );
+        // 光秃秃的数就是声明单位下的数
+        assert_eq!(value("number", Some("万元"), "5000"), Some(json!(5000.0)));
+        assert_eq!(value("number", Some("人"), "约350名"), Some(json!(350.0)));
+        // 只写到年的日期按年
+        assert_eq!(value("date", None, "1982年"), Some(json!("1982")));
     }
 
-    /// 括号出现在字符串里不算结构——`"a[b"` 不是一个开括号。
+    /// 换不了的不换：货币对不上、读不出数的，宁缺勿脏
     #[test]
-    fn brackets_inside_strings_are_not_structure() {
-        let raw =
-            r#"{"entities": [], "facts": [{"subject": "a[b{c", "predicate": "p", "object": "o"}]}"#;
-        let x = parse_response(raw).unwrap();
-        assert_eq!(x.facts.len(), 1);
-        assert!(!x.truncated, "结构完整，不该判成截断");
-    }
-
-    /// 连一个完整对象都没有时，仍然要报失败——**容错不是把空结果说成成功**。
-    #[test]
-    fn a_reply_with_nothing_complete_still_fails() {
-        assert!(parse_response(r#"{"facts": [{"subject": "a"#).is_err());
+    fn what_cannot_be_read_is_not_written() {
+        assert_eq!(value("number", Some("万元"), "5000万美元"), None);
+        assert_eq!(value("number", Some("人"), "超过一千人"), None);
+        assert_eq!(value("date", None, "2023年底"), None);
+        assert_eq!(value("bool", None, "尚未上市"), None);
     }
 
     #[test]
-    fn parse_response_with_fence() {
-        let raw = "好的，结果如下：\n```json\n{\"entities\":[{\"name\":\"张三\",\"type\":\"person\"}],\"facts\":[]}\n```";
-        let e = parse_response(raw).unwrap();
-        assert_eq!(e.entities.len(), 1);
-        assert_eq!(e.entities[0].type_key, "person");
-    }
-
-    /// specific_type 在骨架里、也在规则里，且两处都说"永远要填"。
-    ///
-    /// 只写进骨架是不够的：**规则与骨架冲突时骨架赢**（语言那条就栽过一次）。
-    /// 这里两边一致，所以要一起钉住。
-    #[test]
-    fn every_entity_is_asked_for_its_own_words() {
-        let msgs = build_messages(&[], &[], &[], None, "a.txt", &[], "text");
-        let sys = &msgs[0].content;
-        assert!(sys.contains("\"specific_type\":\"what you would call it\""));
-        assert!(sys.contains("required on every entity"));
-        // 关键的一句：不校验。校验它就等于又造了一个词表
-        assert!(sys.contains("never checked against the list"));
-        // 与 type 的关系必须说清楚，否则模型会把粗类抄一遍
-        assert!(sys.contains("narrower than"));
+    fn a_figure_or_a_date_is_not_a_thing() {
+        for v in [
+            "5000万元",
+            "8.6亿元",
+            "1200人",
+            "约350名",
+            "2015年3月12日",
+            "1978年5月",
+            "2020年",
+            "2015-03-12",
+            "$5 billion",
+            "52%",
+        ] {
+            assert!(literal_object(v, true), "{v}");
+        }
+        // 光秃秃的数：没点名的是值，点了名的多半是个东西（《1984》、360）
+        assert!(literal_object("1200", false));
+        assert!(!literal_object("1984", true));
+        for name in ["3M", "7天", "2023年底", "星河科技", "董事长兼总经理", "K2"] {
+            assert!(!literal_object(name, false), "{name}");
+        }
     }
 }

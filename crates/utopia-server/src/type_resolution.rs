@@ -104,6 +104,15 @@ pub struct NeighbourVote {
 /// 独立成一步是有意的——在花力气建裁决之前，先回答"检索到底找不找得到"。
 /// 找不到的话，裁决做得再好也没有用。
 pub async fn preview(state: &AppState, kb_id: Uuid) -> AppResult<Vec<TypeSuggestion>> {
+    preview_with(state, kb_id, false).await
+}
+
+/// `unattended` = 自动跑：只看引擎没看过的实体（见 `entities_for_type_resolution`）
+async fn preview_with(
+    state: &AppState,
+    kb_id: Uuid,
+    unattended: bool,
+) -> AppResult<Vec<TypeSuggestion>> {
     // 只补类那一半：这一步用不到关系，而一份大本体的关系有一千多条
     let _ = ontology_index::refresh_scoped(
         state,
@@ -111,8 +120,13 @@ pub async fn preview(state: &AppState, kb_id: Uuid) -> AppResult<Vec<TypeSuggest
         Some(utopia_store::ontology::TypeKind::Entity),
     )
     .await;
-    let subjects =
-        utopia_store::resolution::entities_for_type_resolution(&state.pool, kb_id, BATCH).await?;
+    let subjects = utopia_store::resolution::entities_for_type_resolution(
+        &state.pool,
+        kb_id,
+        BATCH,
+        unattended,
+    )
+    .await?;
     if subjects.is_empty() {
         return Ok(Vec::new());
     }
@@ -166,6 +180,14 @@ pub async fn preview(state: &AppState, kb_id: Uuid) -> AppResult<Vec<TypeSuggest
         slots.push((pi, slot));
     }
 
+    // 邻居先一起取（#514）：六十个查询彼此无关，有界并发取回来，下面再按原顺序推理。
+    // 后代集合按粗类记一批：同一个粗类的递归 CTE 一批里只发一次
+    let ids: Vec<Uuid> = subjects.iter().map(|s| s.id).collect();
+    let mut neighbour_lists =
+        utopia_store::resolution::nearest_typed_for_each(&state.pool, kb_id, &ids, NEIGHBOURS)
+            .await?;
+    let mut descendants_memo = utopia_store::resolution::DescendantsMemo::default();
+
     let mut out = Vec::with_capacity(subjects.len());
     for (i, s) in subjects.iter().enumerate() {
         // 粗类的后代**排前面，但不是唯一能选的**。
@@ -179,13 +201,9 @@ pub async fn preview(state: &AppState, kb_id: Uuid) -> AppResult<Vec<TypeSuggest
         // 该说不的是裁决那一步：它看得到描述、看得到粗类，能说出"这不是"。
         // 还没有类的实体没有"粗类的后代"这个轴可用（0009），整张类表都是候选，
         // 排序就纯按检索顺序来
-        let descendants: std::collections::HashSet<_> = match s.coarse_id {
-            Some(c) => utopia_store::resolution::descendants_of(&state.pool, kb_id, c)
-                .await?
-                .into_iter()
-                .collect(),
-            None => std::collections::HashSet::new(),
-        };
+        let descendants = descendants_memo
+            .get(&state.pool, kb_id, s.coarse_id)
+            .await?;
         // **两路交替取，不按距离合并。**
         //
         // 距离在两路之间不可比：短查询（"医药集团"）产生的距离系统性地小于
@@ -228,10 +246,8 @@ pub async fn preview(state: &AppState, kb_id: Uuid) -> AppResult<Vec<TypeSuggest
         // 剩下的顺序就是两路交替的检索序:检索决定端什么上去,裁决决定它是什么,
         // `crosses_axis` 决定要不要人看。一层一件事。
         let candidates: Vec<_> = ranked.into_iter().take(CANDIDATES as usize).collect();
-        // 第二路：语境相似的已定类实体，按类投票
-        let raw =
-            utopia_store::resolution::nearest_typed_entities(&state.pool, kb_id, s.id, NEIGHBOURS)
-                .await?;
+        // 第二路：语境相似的已定类实体，按类投票（上面一起取回来的，这里按序拿）
+        let raw = std::mem::take(&mut neighbour_lists[i]);
         let mut votes: std::collections::BTreeMap<String, (usize, f64, Vec<String>, bool)> =
             std::collections::BTreeMap::new();
         for (name, _tid, key, distance, same_doc) in raw {
@@ -300,8 +316,8 @@ fn profile_of(s: &utopia_store::resolution::TypeCandidateSubject) -> String {
         }
     }
     parts.push(s.canonical_name.clone());
-    if !s.aliases.is_empty() {
-        parts.push(s.aliases.join(", "));
+    if !s.other_names.is_empty() {
+        parts.push(s.other_names.join(", "));
     }
     if !s.roles.is_empty() {
         parts.push(s.roles.join(" "));
@@ -416,7 +432,67 @@ pub struct ReviewItem {
 ///
 /// 谁点的运行记在 `ontology.types_resolved` 审计里,带批次 id,查得到。
 pub async fn resolve(state: &AppState, kb_id: Uuid) -> AppResult<ResolutionOutcome> {
-    let items = preview(state, kb_id).await?;
+    resolve_with(state, kb_id, false).await
+}
+
+/// 抽取结束后的自动一轮（0016 C2）。
+///
+/// 与人点的那一轮是同一套判定——在原类子树里精化的自动改，跨轴的留给人——差别只有
+/// 两处：只看引擎没看过的实体，且看过的打上 `type_resolved_at`，下一轮不回头。
+/// 待人工的那一档这里**不落库**：它们留在候选里，人在 Ontology 页点一次运行就会再
+/// 见到（那条路不看标记）。开关关着的库什么都不做。
+///
+/// 一次任务最多跑 `MAX_ROUNDS` 轮，每轮一次模型调用、六十个实体；更多的等下一篇
+/// 文档抽完再排——任务是按库去重入队的，不会堆积
+pub async fn resolve_types_job(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
+    const MAX_ROUNDS: usize = 10;
+    let kb = utopia_store::kbs::get(&state.pool, kb_id).await?;
+    if !kb.auto_type_resolution {
+        return Ok(());
+    }
+    let (mut retyped, mut for_review, mut left_alone, mut rounds) = (0u32, 0usize, 0usize, 0usize);
+    for _ in 0..MAX_ROUNDS {
+        let outcome = resolve_with(state, kb_id, true).await?;
+        let seen = outcome.retyped as usize + outcome.for_review.len() + outcome.left_alone.len();
+        if seen == 0 {
+            break;
+        }
+        rounds += 1;
+        retyped += outcome.retyped;
+        for_review += outcome.for_review.len();
+        left_alone += outcome.left_alone.len();
+    }
+    if rounds > 0 {
+        let _ = utopia_store::audit::record_opt(
+            &state.pool,
+            Some(kb_id),
+            None,
+            "ontology.types_resolved",
+            "knowledge_base",
+            Some(kb_id),
+            serde_json::json!({
+                "via": "job", "rounds": rounds, "retyped": retyped,
+                "for_review": for_review, "left_alone": left_alone,
+            }),
+        )
+        .await;
+        tracing::info!(%kb_id, rounds, retyped, for_review, left_alone, "类型消解自动跑完成");
+    }
+    Ok(())
+}
+
+async fn resolve_with(
+    state: &AppState,
+    kb_id: Uuid,
+    unattended: bool,
+) -> AppResult<ResolutionOutcome> {
+    let items = preview_with(state, kb_id, unattended).await?;
+    // 自动跑：这一批不管裁成哪一档都算看过（连检索都没给候选的也算——
+    // 它们下一轮照样没有），否则同一批实体每轮都回来
+    if unattended && !items.is_empty() {
+        let ids: Vec<Uuid> = items.iter().map(|i| i.entity_id).collect();
+        utopia_store::resolution::mark_type_judged(&state.pool, kb_id, &ids).await?;
+    }
     let items: Vec<_> = items
         .into_iter()
         .filter(|i| !i.candidates.is_empty() || !i.neighbours.is_empty())

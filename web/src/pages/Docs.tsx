@@ -8,14 +8,24 @@ import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { Command, Search } from "lucide-react";
 import { api } from "../api";
 import { S } from "../i18n";
-import { GithubMark, SectionMark } from "../ui";
-import { UserMenu } from "./UserMenu";
+import {
+  Button,
+  cn,
+  Input,
+  Row,
+  rowClass,
+  SectionMark,
+  buttonLike,} from "../ui";
+import { HeaderActions } from "./HeaderActions";
 import { usePageTitle } from "../useTitle";
 import ingestMd from "../docs/ingest.md?raw";
+import mcpMd from "../docs/mcp.md?raw";
+import { fetchMe } from "../authSession";
 
 /** 文档清单：slug → 标题 + 内容（构建期打进 bundle） */
 const DOCS: { slug: string; title: string; body: string }[] = [
   { slug: "ingest", title: "Ingest interfaces", body: ingestMd },
+  { slug: "mcp", title: "Agents over MCP", body: mcpMd },
 ];
 
 /** 全文检索（客户端，文档已在 bundle 里）：命中行 → 文档 + 以命中词为中心的摘录 */
@@ -50,7 +60,7 @@ function Highlighted({ text, q }: { text: string; q: string }) {
           /* 命中词用警示琥珀：结果列表里一眼定位到匹配处 */
           <mark
             key={i}
-            className="rounded-[3px] bg-[rgba(242,182,109,0.16)] px-0.5 text-[var(--u-warn)]"
+            className="u-mark"
           >
             {p}
           </mark>
@@ -108,8 +118,8 @@ export function DocsPage() {
   // 标题：`Utopia | {文章名}`——Charter 是门脸字标，标题直接给文章
   usePageTitle(S.app.name, doc.title);
   // 公开页也感知登录态：已登录给用户菜单，未登录给 Sign in
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
-  const health = useQuery({ queryKey: ["health"], queryFn: api.health, staleTime: Infinity });
+  const me = useQuery({ queryKey: ["me"], queryFn: fetchMe, retry: false });
+  const health = useQuery({ queryKey: ["health"], queryFn: api.health });
 
   // 滚动跟随：视口上沿之上最近的标题为当前小节；
   // 滚到底强制激活最后一节（短末节永远越不过判定线）
@@ -168,22 +178,19 @@ export function DocsPage() {
 
   return (
     <div className="h-screen flex flex-col overflow-hidden">
-      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center px-5">
-        <SectionMark text={S.docs.brand} title={S.docs.backTitle} />
+      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-12 shrink-0 flex items-center px-2">
+        <SectionMark className="pl-3" text={S.docs.brand} title={S.docs.backTitle} />
         {/* 居中搜索：检索打包在本地的全部文档；宽度对齐正文栏（max-w-3xl 去掉 px-8） */}
         <div
           ref={searchRef}
           className="absolute left-1/2 -translate-x-1/2 w-[min(44rem,55vw)]"
         >
           <div className="relative">
-            <Search
-              size={13}
-              className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 pointer-events-none"
-            />
-            <input
+            {/* 中号：与别处的搜索框同一个高度（32），小号在顶栏里显得矮一截 */}
+            <Input
+              className="w-full"
+              icon={<Search size={13} />}
               ref={inputRef}
-              className="input-dark w-full pr-14 py-1.5 text-[13px]"
-              style={{ paddingLeft: "2.1rem" }}
               placeholder={S.docs.searchPlaceholder}
               value={q}
               onChange={(e) => setQ(e.target.value)}
@@ -191,68 +198,51 @@ export function DocsPage() {
             {/* 快捷键提示：输入中不占视线。⌘ 用 lucide 图标；
                 Ctrl 无图形符号（⌘ 是 Mac 专属键符），Windows 规范写法就是文字 */}
             {!q && (
-              <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1 rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 font-sans text-[10px] text-neutral-600">
+              <kbd className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1 rounded-cell border border-line bg-surface px-2 py-1 font-sans text-fine text-ink-2">
                 {IS_MAC ? <Command size={9} /> : <span>Ctrl</span>}
                 <span>K</span>
               </kbd>
             )}
           </div>
           {q.trim().length >= 2 && (
-            <div className="u-pop u-pop-in u-pop-in-tl absolute inset-x-0 top-full mt-2 rounded-xl shadow-2xl overflow-hidden">
+            <div className="u-menu-glass u-pop-in u-pop-in-tl absolute inset-x-0 top-full mt-2 rounded-overlay u-lift-strong overflow-hidden">
               {results.length === 0 ? (
-                <p className="px-3.5 py-3 text-xs text-neutral-500">{S.docs.noResults}</p>
+                <p className="px-4 py-3 text-small text-ink-2">{S.docs.noResults}</p>
               ) : (
                 results.map((r, i) => (
-                  <button
+                  <Row
                     key={i}
+                    density="menu"
+                    className="border-b border-line px-4 py-3 last:border-0"
                     onClick={() => {
                       setQ("");
                       navigate({ to: "/docs/$slug", params: { slug: r.slug } });
                     }}
-                    className="w-full text-left px-3.5 py-2.5 hover:bg-white/[0.06] border-b border-white/5 last:border-0"
                   >
-                    <div className="text-[11px] text-neutral-500">{r.title}</div>
-                    <div className="text-[13px] text-neutral-200 truncate">
+                    <div className="text-fine text-ink-2">{r.title}</div>
+                    <div className="text-body text-ink truncate">
                       <Highlighted text={r.snippet} q={q} />
                     </div>
-                  </button>
+                  </Row>
                 ))
               )}
             </div>
           )}
         </div>
 
-        {/* 右侧：显式返回（与字标双路回城）+ GitHub·版本胶囊 + 登录态 */}
-        <div className="ml-auto flex items-center gap-1.5">
-          <Link
-            to="/"
-            className="px-2 py-1 rounded-lg text-[12.5px] text-neutral-500 hover:text-neutral-200 hover:bg-white/[0.05] transition-colors"
-          >
-            {S.account.backToApp}
-          </Link>
-          <a
-            href={S.login.githubUrl}
-            target="_blank"
-            rel="noreferrer"
-            title="GitHub"
-            className="flex items-center gap-1.5 rounded-full border border-white/10 px-2.5 py-1 text-neutral-500 hover:text-neutral-200 hover:border-white/25 transition-colors"
-          >
-            <GithubMark size={13} />
-            {health.data && <span className="u-num text-[11px]">v{health.data.version}</span>}
-          </a>
-          {me.data ? (
-            <div className="ml-1">
-              <UserMenu user={me.data} />
-            </div>
-          ) : me.isError ? (
-            <Link
-              to="/login"
-              className="u-btn u-btn-ghost px-3 py-1.5 text-xs"
-            >
-              {S.login.signIn}
-            </Link>
-          ) : null}
-        </div>
+        {/* 右侧与 App、账户页同一份：换页时不该动。没登录就只剩一个「登录」 */}
+        <HeaderActions
+          link={{ to: "/", label: S.account.backToApp }}
+          version={health.data?.version}
+          user={me.data}
+          signedOut={
+            me.isError ? (
+              <Link to="/login" className={buttonLike("ghost")}>
+                {S.login.signIn}
+              </Link>
+            ) : null
+          }
+        />
       </header>
 
       {/* 整页滚动（滚动条贴窗口最右），侧栏 sticky 钉住——正规文档站布局 */}
@@ -262,17 +252,13 @@ export function DocsPage() {
         className="flex-1 min-h-0 overflow-y-auto u-scroll"
       >
         <div className="flex items-start">
-          <aside className="w-64 shrink-0 sticky top-0 h-[calc(100vh-3.5rem)] glass-strong border-y-0 border-l-0 p-3 space-y-0.5">
+          <aside className="w-64 shrink-0 sticky top-0 h-[calc(100vh-3.5rem)] glass-strong border-y-0 border-l-0 px-2 py-3 space-y-1">
             {DOCS.map((d) => (
               <Link
                 key={d.slug}
                 to="/docs/$slug"
                 params={{ slug: d.slug }}
-                className={`block rounded-lg px-3 py-2 text-[13px] ${
-                  d.slug === doc.slug
-                    ? "u-nav-active"
-                    : "text-neutral-400 hover:bg-white/[0.05] hover:text-neutral-200"
-                }`}
+                className={rowClass(d.slug === doc.slug, "nav")}
               >
                 {d.title}
               </Link>
@@ -282,8 +268,10 @@ export function DocsPage() {
           {/* 上下都留足空白：标题不顶着头，末段内容能滚到屏幕中部——人读屏幕中间。
               排版交给官方 @tailwindcss/typography（prose，16px 基准），
               自定义只剩：标题锚点 id、外链新开、表格横向滚动容器 */}
-          {/* prose-neutral：默认 gray 阶带蓝相（oklch 258°），违反 chrome 零色偏 */}
-          <article className="prose prose-neutral prose-invert prose-headings:scroll-mt-6 prose-code:before:content-none prose-code:after:content-none flex-1 min-w-0 max-w-3xl mx-auto px-8 pt-16 pb-[40vh]">
+          {/* 排版走官方的 shadcn/typeset（src/typeset.css）：容器里的
+              标题、列表、表格、代码全由它管，内容本身不带一个类；
+              字号与字体在 `.typeset-docs` 那个预设里调，颜色接我们的令牌 */}
+          <article className="typeset typeset-docs [&_h1]:scroll-mt-6 [&_h2]:scroll-mt-6 [&_h3]:scroll-mt-6 flex-1 min-w-0 max-w-3xl mx-auto px-8 pt-16 pb-[40vh]">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
@@ -313,23 +301,21 @@ export function DocsPage() {
           {/* 右侧目录：sticky 钉住，与正文标题同一水平线起头 */}
           {toc.length > 0 && (
             <aside className="hidden lg:block w-64 shrink-0 sticky top-0 pt-16 pr-8">
-              <nav className="space-y-0.5">
+              <nav className="space-y-1">
                 {toc.map((h) => (
-                  <button
+                  <Button variant="ghost" size="sm"
                     key={h.id}
                     onClick={() =>
                       document.getElementById(h.id)?.scrollIntoView({ behavior: "smooth" })
                     }
-                    className={`block w-full text-left px-2 py-1.5 text-sm leading-snug transition-colors ${
-                      h.level === 3 ? "pl-5" : ""
-                    } ${
-                      activeHeading === h.id
-                        ? "text-white"
-                        : "text-neutral-500 hover:text-neutral-300"
-                    }`}
+                    className={cn(
+                      "h-auto w-full justify-start whitespace-normal py-2 text-left leading-snug",
+                      h.level === 3 && "pl-6",
+                      activeHeading === h.id ? "text-ink" : "text-ink-2",
+                    )}
                   >
                     {h.text}
-                  </button>
+                  </Button>
                 ))}
               </nav>
             </aside>

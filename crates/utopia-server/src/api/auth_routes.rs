@@ -4,7 +4,7 @@ use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
 use serde::Deserialize;
 use serde_json::json;
-use utopia_core::models::{User, Workspace};
+use utopia_core::models::User;
 use utopia_core::AppError;
 
 use crate::auth::{self, AuthUser};
@@ -50,6 +50,7 @@ pub async fn register(
     jar: CookieJar,
     Json(req): Json<RegisterReq>,
 ) -> ApiResult<(CookieJar, Json<serde_json::Value>)> {
+    password_login_enabled(&state)?;
     validate_register(&req)?;
     let hash = auth::hash_password(&req.password)?;
     let org_name = req
@@ -62,7 +63,11 @@ pub async fn register(
     let open = utopia_store::access::open_registration(&state.pool)
         .await
         .unwrap_or(state.open_registration);
-    let (user, workspace): (User, Workspace) = utopia_store::accounts::register(
+    let utopia_store::accounts::Registered {
+        user,
+        workspace,
+        general_kb: _,
+    } = utopia_store::accounts::register(
         &state.pool,
         req.email.trim(),
         &hash,
@@ -71,6 +76,12 @@ pub async fn register(
         open,
     )
     .await?;
+
+    // 首个用户那个 General 库**空着起步**（#580）。从前这里给它装 schema.org（#322），
+    // 理由是没有 domain/range 事实就没方向；量过之后（#580 的对照）：包给的是实体
+    // 类型，不是谓词——装了包八成事实照样没谓词；空库靠 bootstrap 从文档里长出
+    // 十几个类、上百条关系，都是语料自己的说法，每块的提示词从 18k tokens 回到 2k。
+    // 包还在建库对话框里，要的人一键装
 
     let token = auth::issue_token(&state, user.id)?;
     let secure = auth::behind_tls(&headers, state.cookie_secure);
@@ -114,15 +125,32 @@ pub async fn login(
     jar: CookieJar,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<(CookieJar, Json<serde_json::Value>)> {
+    password_login_enabled(&state)?;
     let email = req.email.trim();
-    let Some(user) = utopia_store::accounts::find_user_by_email(&state.pool, email).await? else {
-        record_login_failure(&state, email, "unknown_email").await;
-        return Err(AppError::Unauthorized.into());
+    let user = utopia_store::accounts::find_user_by_email(&state.pool, email).await?;
+    // 邮箱存在与否的分支要走一样的代码路径：少了 argon2 的那一支能通过
+    // 响应时间差枚举出哪些邮箱注册过（一份密码库扫完后剩下能登录的就是
+    // 真用户）。在「邮箱不存在」分支里跑一次 argon2 校验，结果忽略——
+    // 这条分支因此和「邮箱存在、密码错」一样慢。
+    let password_valid = match &user {
+        Some(u) => auth::verify_password(&req.password, &u.password_hash),
+        None => {
+            let _ = auth::verify_password(&req.password, auth::dummy_password_hash());
+            false
+        }
     };
-    if !auth::verify_password(&req.password, &user.password_hash) {
-        record_login_failure(&state, email, "bad_password").await;
+    if !password_valid {
+        let reason = if user.is_some() {
+            "bad_password"
+        } else {
+            "unknown_email"
+        };
+        record_login_failure(&state, email, reason).await;
         return Err(AppError::Unauthorized.into());
     }
+    let Some(user) = user else {
+        unreachable!("password_valid is only true for an existing user")
+    };
     let token = auth::issue_token(&state, user.id)?;
     let secure = auth::behind_tls(&headers, state.cookie_secure);
     let jar = jar.add(auth::auth_cookie(token.clone(), secure));
@@ -226,4 +254,15 @@ pub async fn change_password(
     )
     .await;
     Ok(Json(json!({ "ok": true })))
+}
+
+fn password_login_enabled(state: &AppState) -> Result<(), AppError> {
+    if super::oidc_routes::password_login(state) {
+        Ok(())
+    } else {
+        Err(AppError::invalid(
+            "password_login_disabled",
+            "Password sign-in is turned off on this deployment; sign in with SSO",
+        ))
+    }
 }

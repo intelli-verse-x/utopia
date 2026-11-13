@@ -6,17 +6,57 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
-use utopia_core::models::Role;
+use utopia_core::models::{Role, SOURCE_SECRET_KEYS};
 use uuid::Uuid;
 
 use super::graph_routes::require_kb;
-use crate::auth::AuthUser;
+use crate::auth::{AuthUser, SessionOrToken};
 use crate::error::ApiResult;
 use crate::state::AppState;
 
 /// 生成 api 来源的推送密钥。
-fn new_ingest_token() -> String {
+pub(crate) fn new_ingest_token() -> String {
     format!("utp_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// 推送来的密钥对不对。**常量时间比对。**
+///
+/// 挡的不是计时攻击——这条路上它打不动：密钥是服务端生成的 244 位随机串
+/// （`new_ingest_token`，两个 v4 拼起来），比对又发生在一次数据库往返之后，
+/// 毫秒级的网络与查询抖动盖住的是纳秒级的差异。真正在保护这把密钥的是熵。
+///
+/// 这样写是为了**读代码的人不必重新推一遍上面那段**：仓库里另外两条令牌路径
+/// 都不做明文比对（个人令牌存 sha256 按哈希查，会话走 JWT 验签），这里是唯一
+/// 要拿明文对明文的地方，那就让它自己看起来是想过的。
+///
+/// 长度不等直接返回——`ct_eq` 只对等长切片有意义。密钥长度固定（`utp_` + 64 位
+/// 十六进制），不是秘密的一部分，在这里短路不泄漏任何东西。
+fn push_key_matches(stored: Option<&str>, offered: &str) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    if stored.len() != offered.len() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    stored.as_bytes().ct_eq(offered.as_bytes()).into()
+}
+
+/// 取一条来源，并确认它属于路径上的这个库。
+///
+/// `require_kb` 只查人对库的权限；来源 id 是另一个维度——不比对的话，A 库的
+/// Editor 拿着 B 库来源的 id 就能同步、清理、删除它。不属于就当不存在（404），
+/// 与 `get_token` 一直以来的做法一致
+async fn source_in_kb(
+    state: &AppState,
+    kb_id: Uuid,
+    source_id: Uuid,
+) -> ApiResult<utopia_core::models::Source> {
+    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    if source.kb_id != kb_id {
+        return Err(utopia_core::AppError::NotFound.into());
+    }
+    Ok(source)
 }
 
 pub async fn list(
@@ -44,13 +84,31 @@ pub struct CreateBody {
     pub sync_cron: Option<String>,
 }
 
+/// 写令牌也能建（0014 决定 6）：给一个镜像仓库配 `statements` 或 `api` 来源，不该要人
+/// 一个个手点。
+///
+/// 令牌只建推送型（`statements`/`api`，服务器不替它们拉任何东西）：`url`/`rss`/`custom`
+/// 一建好服务器就按时去拉（`custom` 还带着存下的凭据），漏出去的 CI 令牌不该能让服务器定时去敲
+/// 任意地址。会话照旧建什么都行
 pub async fn create(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    caller: SessionOrToken,
     Path(kb_id): Path<Uuid>,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    caller.require_write(Some(kb_id))?;
+    if caller.pat.is_some() && !is_push_kind(&body.kind) {
+        return Err(utopia_core::AppError::CodedForbidden {
+            code: "token_source_kind",
+            message: "A token creates only statements or api sources; other kinds take a session"
+                .into(),
+        }
+        .into());
+    }
+    let token_id = caller.token_id();
+    let user = caller.user;
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    validate_rss_config(&body.kind, &body.config)?;
     let source = utopia_store::sources::create(
         &state.pool,
         kb_id,
@@ -74,7 +132,7 @@ pub async fn create(
     }
     // api 来源：生成专属推送密钥（此后可随时经 get_token 查看）
     let mut ingest_token: Option<String> = None;
-    if source.kind == "api" {
+    if is_push_kind(&source.kind) {
         let token = new_ingest_token();
         utopia_store::sources::set_ingest_token(&state.pool, source.id, &token).await?;
         ingest_token = Some(token);
@@ -87,7 +145,10 @@ pub async fn create(
         "source.created",
         "source",
         Some(source.id),
-        json!({ "kind": source.kind, "name": source.name }),
+        utopia_store::audit::via_token(
+            json!({ "kind": source.kind, "name": source.name }),
+            token_id,
+        ),
     )
     .await;
     Ok(Json(
@@ -95,29 +156,38 @@ pub async fn create(
     ))
 }
 
-/// 查看 api 来源的推送密钥（Editor；列表响应从不携带，查看走这里）。
+/// 有推送密钥的来源：`api` 推文档，`statements` 推陈述（0054）。两种的密钥同一套
+/// 生成、查看、轮换
+fn is_push_kind(kind: &str) -> bool {
+    matches!(kind, "api" | "statements")
+}
+
+/// 查看推送密钥（Editor；列表响应从不携带，查看走这里）。
+///
+/// 令牌要 write：密钥能往库里推东西，读令牌拿到它就等于绕过了自己的 scope
 pub async fn get_token(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    caller: SessionOrToken,
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Editor).await?;
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
-    if source.kb_id != kb_id || source.kind != "api" {
+    caller.require_write(Some(kb_id))?;
+    require_kb(&state, &caller.user, kb_id, Role::Editor).await?;
+    let source = source_in_kb(&state, kb_id, source_id).await?;
+    if !is_push_kind(&source.kind) {
         return Err(utopia_core::AppError::NotFound.into());
     }
     Ok(Json(json!({ "ingest_token": source.ingest_token })))
 }
 
-/// 轮换 api 来源的推送密钥：旧密钥立即失效。
+/// 轮换推送密钥：旧密钥立即失效。
 pub async fn rotate_token(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
-    if source.kb_id != kb_id || source.kind != "api" {
+    let source = source_in_kb(&state, kb_id, source_id).await?;
+    if !is_push_kind(&source.kind) {
         return Err(utopia_core::AppError::NotFound.into());
     }
     let token = new_ingest_token();
@@ -125,12 +195,41 @@ pub async fn rotate_token(
     Ok(Json(json!({ "ingest_token": token })))
 }
 
-/// 响应前剔除凭据（auth_header 只进不出）。
-fn mask_secrets(mut source: utopia_core::models::Source) -> utopia_core::models::Source {
-    if let Some(obj) = source.config.as_object_mut() {
-        obj.remove("auth_header");
+/// 响应前剔除凭据（只进不出；键见 `SOURCE_SECRET_KEYS`）。
+fn mask_secrets(source: utopia_core::models::Source) -> utopia_core::models::Source {
+    source.without_secrets()
+}
+
+fn validate_rss_config(kind: &str, config: &serde_json::Value) -> utopia_core::AppResult<()> {
+    if kind == "rss" {
+        utopia_store::sources::rss_content_mode(config)?;
     }
-    source
+    Ok(())
+}
+
+/// 更新时凭据的合并规则，每个 `SOURCE_SECRET_KEYS` 里的键一样：新配置里**没有**这个键
+/// 或值是空串 → 保留库里的原值（表单留空就是「别动」）；显式 `null` → 删掉；
+/// 其余照新值。响应从不回显，所以客户端没有办法把旧值原样送回来，规则只能长在这里
+fn keep_secrets(next: &mut serde_json::Value, existing: &serde_json::Value) {
+    let Some(obj) = next.as_object_mut() else {
+        return;
+    };
+    for key in SOURCE_SECRET_KEYS {
+        let keep = match obj.get(*key) {
+            None => true,
+            Some(serde_json::Value::Null) => {
+                obj.remove(*key);
+                false
+            }
+            Some(v) => v.as_str().is_some_and(|s| s.trim().is_empty()),
+        };
+        if keep {
+            obj.remove(*key);
+            if let Some(prev) = existing.get(*key) {
+                obj.insert((*key).to_string(), prev.clone());
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -158,23 +257,14 @@ pub async fn update(
     Json(body): Json<UpdateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // 凭据只进不出：响应从不回显 auth_header，表单留空 = 保留库里原值
+    let existing = source_in_kb(&state, kb_id, source_id).await?;
+    // 凭据只进不出：响应从不回显，表单留空 / 没传 = 保留库里原值
     let mut config = body.config;
     if let Some(cfg) = config.as_mut() {
-        let blank = cfg
-            .get("auth_header")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .is_none_or(|s| s.is_empty());
-        if blank {
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.remove("auth_header");
-                let existing = utopia_store::sources::get(&state.pool, source_id).await?;
-                if let Some(prev) = existing.config.get("auth_header").and_then(|v| v.as_str()) {
-                    obj.insert("auth_header".into(), json!(prev));
-                }
-            }
-        }
+        keep_secrets(cfg, &existing.config);
+    }
+    if let Some(cfg) = config.as_ref() {
+        validate_rss_config(&existing.kind, cfg)?;
     }
     let source = utopia_store::sources::update(
         &state.pool,
@@ -187,7 +277,7 @@ pub async fn update(
     )
     .await?;
     state.emit_source(kb_id);
-    // 审计不落凭据：config 只记除 auth_header 外的键
+    // 审计不落凭据：config 只记「改没改」
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -208,9 +298,10 @@ pub async fn cleanup_missing(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let ids = utopia_store::documents::list_missing(&state.pool, source_id).await?;
     for id in &ids {
-        utopia_store::documents::delete(&state.pool, *id).await?;
+        utopia_store::documents::delete(&state.pool, kb_id, *id, Some(user.id)).await?;
         let search = state.search.clone();
         let did = id.to_string();
         tokio::task::spawn_blocking(move || search.delete_document(&did))
@@ -218,9 +309,18 @@ pub async fn cleanup_missing(
             .map_err(|e| utopia_core::AppError::Other(e.into()))?
             .map_err(utopia_core::AppError::Other)?;
     }
+    // 与单篇删除同一个收尾：前提没了，派生当场跟上，而不是挂到下一轮定时推导（#875）。
+    // 一批只推一遍
+    if !ids.is_empty() {
+        super::documents_routes::settle_derivations(&state, kb_id).await?;
+    }
     state.emit_source(kb_id);
     Ok(Json(json!({ "deleted": ids.len() })))
 }
+
+#[cfg(test)]
+#[path = "sources_cleanup_tests.rs"]
+mod cleanup_tests;
 
 pub async fn delete(
     State(state): State<AppState>,
@@ -229,7 +329,7 @@ pub async fn delete(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
     // Memory 来源常驻：记忆空间不因来源整理而蒸发（记忆文档本身可在 Library 删除）
-    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    let source = source_in_kb(&state, kb_id, source_id).await?;
     if source.kind == utopia_store::memory::MEMORY_SOURCE_KIND {
         return Err(utopia_core::AppError::invalid(
             "memory_source_permanent",
@@ -259,6 +359,7 @@ pub async fn runs(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let runs = utopia_store::sources::list_runs(&state.pool, source_id, 20).await?;
     Ok(Json(json!({ "runs": runs })))
 }
@@ -269,6 +370,7 @@ pub async fn sync_now(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
     let queued = utopia_store::sources::mark_queued(&state.pool, source_id).await?;
     if queued {
         utopia_store::jobs::enqueue(
@@ -285,6 +387,10 @@ pub async fn sync_now(
 #[derive(Deserialize)]
 pub struct IngestBody {
     pub filename: String,
+    /// 墓碑推送（`deleted: true`）可以不带 content——指南一直这么写，而字段
+    /// 从前是必填，缺了就在反序列化那一步被拒。其余情况仍然必填：空串在
+    /// 下面的校验里挡
+    #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub doc_time: Option<DateTime<Utc>>,
@@ -298,6 +404,16 @@ pub struct IngestBody {
     pub deleted: bool,
 }
 
+/// 推送的回执：动作，重复时再加上占着这份内容的文档
+fn action_reply(action: crate::ingest_sources::IngestAction) -> serde_json::Value {
+    match action {
+        crate::ingest_sources::IngestAction::Duplicate(id) => {
+            json!({ "action": action_str(action), "duplicate_of": id })
+        }
+        _ => json!({ "action": action_str(action) }),
+    }
+}
+
 fn action_str(action: crate::ingest_sources::IngestAction) -> &'static str {
     match action {
         crate::ingest_sources::IngestAction::Created => "created",
@@ -305,6 +421,7 @@ fn action_str(action: crate::ingest_sources::IngestAction) -> &'static str {
         crate::ingest_sources::IngestAction::Moved => "moved",
         crate::ingest_sources::IngestAction::Unchanged => "unchanged",
         crate::ingest_sources::IngestAction::Tombstoned => "marked_missing",
+        crate::ingest_sources::IngestAction::Duplicate(_) => "duplicate",
     }
 }
 
@@ -338,7 +455,26 @@ pub async fn ingest(
     )
     .await
     .map_err(utopia_core::AppError::Other)?;
-    Ok(Json(json!({ "action": action_str(action) })))
+    Ok(Json(action_reply(action)))
+}
+
+/// 推送失败的两种性质。**调用方发错了**和**我们这边没接住**得分开：前者记进
+/// run 供集成调试，但不算来源同步失败——来源没坏，是那一次请求不合格；
+/// 后者才该把来源标成 failed 并进告警中心。从前两者都走 `finish_sync(error)`，
+/// 一次格式错误就让铃铛说"来源同步失败，没有新内容进来"
+enum PushError {
+    /// 4xx：负载不合格（JSON 解析、缺字段）
+    Rejected(String),
+    /// 摄入本身失败
+    Failed(String),
+}
+
+impl PushError {
+    fn message(&self) -> &str {
+        match self {
+            PushError::Rejected(m) | PushError::Failed(m) => m,
+        }
+    }
 }
 
 /// 认证之后的推送处理：解析 + 校验 + 摄入/墓碑。错误一律返回文字（记进 run）。
@@ -346,18 +482,19 @@ async fn handle_push(
     state: &AppState,
     source: &utopia_core::models::Source,
     bytes: &[u8],
-) -> Result<crate::ingest_sources::IngestAction, String> {
-    let body: IngestBody =
-        serde_json::from_slice(bytes).map_err(|e| format!("Invalid JSON payload: {e}"))?;
-    let identity = body
+) -> Result<crate::ingest_sources::IngestAction, PushError> {
+    let body: IngestBody = serde_json::from_slice(bytes)
+        .map_err(|e| PushError::Rejected(format!("Invalid JSON payload: {e}")))?;
+    let declared = body
         .external_id
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| body.filename.trim())
-        .to_string();
+        .filter(|s| !s.is_empty());
+    let identity = declared.unwrap_or_else(|| body.filename.trim()).to_string();
     if identity.is_empty() {
-        return Err("external_id or filename is required".into());
+        return Err(PushError::Rejected(
+            "external_id or filename is required".into(),
+        ));
     }
     let key = format!("api:{identity}");
 
@@ -365,29 +502,40 @@ async fn handle_push(
     if body.deleted {
         utopia_store::documents::mark_missing_keys(&state.pool, source.id, &[key])
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PushError::Failed(e.to_string()))?;
         return Ok(crate::ingest_sources::IngestAction::Tombstoned);
     }
 
     if body.filename.trim().is_empty() || body.content.trim().is_empty() {
-        return Err("filename and content are required".into());
+        return Err(PushError::Rejected(
+            "filename and content are required".into(),
+        ));
     }
-    let action = crate::ingest_sources::ingest_item(
+    // 带了 external_id 身份就是它：不走「同内容 = 移动」，不把另一个 ID 的文档改成它
+    let action = crate::ingest_sources::ingest_item_with_outcome(
         state,
         source.kb_id,
         source.id,
         &key,
+        if declared.is_some() {
+            crate::ingest_sources::Identity::Declared
+        } else {
+            crate::ingest_sources::Identity::Path
+        },
         body.filename.trim(),
         "text/plain",
         body.content.as_bytes(),
         body.doc_time,
     )
     .await
-    .map_err(|e| e.to_string())?;
-    // 失而复得：曾被墓碑标记的身份再次正常推送，摘掉 missing 标记
-    utopia_store::documents::clear_missing_keys(&state.pool, source.id, &[key])
-        .await
-        .map_err(|e| e.to_string())?;
+    .map_err(|e| PushError::Failed(e.to_string()))?
+    .action;
+    // 失而复得：曾被墓碑标记的身份再次正常推送，摘掉 missing 标记；重复的推送什么也没落，不摘
+    if !matches!(action, crate::ingest_sources::IngestAction::Duplicate(_)) {
+        utopia_store::documents::clear_missing_keys(&state.pool, source.id, &[key])
+            .await
+            .map_err(|e| PushError::Failed(e.to_string()))?;
+    }
     Ok(action)
 }
 
@@ -413,7 +561,7 @@ pub async fn push(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or(utopia_core::AppError::Unauthorized)?;
-    if source.ingest_token.as_deref() != Some(token) {
+    if !push_key_matches(source.ingest_token.as_deref(), token) {
         return Err(utopia_core::AppError::Unauthorized.into());
     }
 
@@ -425,23 +573,271 @@ pub async fn push(
                 crate::ingest_sources::IngestAction::Updated
                 | crate::ingest_sources::IngestAction::Moved => (0, 1),
                 crate::ingest_sources::IngestAction::Unchanged
-                | crate::ingest_sources::IngestAction::Tombstoned => (0, 0),
+                | crate::ingest_sources::IngestAction::Tombstoned
+                | crate::ingest_sources::IngestAction::Duplicate(_) => (0, 0),
             };
             utopia_store::sources::finish_run(&state.pool, run, source.id, None, created, updated)
                 .await?;
             // 来源行同步反映"上一次推送"：操作条/左栏状态点直接可用
             utopia_store::sources::finish_sync(&state.pool, source.id, None, created).await?;
             state.emit_source(source.kb_id);
-            Ok(Json(json!({ "action": action_str(action) })))
+            Ok(Json(action_reply(action)))
         }
-        Err(msg) => {
+        Err(err) => {
+            let msg = err.message().to_string();
             utopia_store::sources::finish_run(&state.pool, run, source.id, Some(&msg), 0, 0)
                 .await?;
-            utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
+            // 只有我们这边没接住才算来源失败；调用方发错了留在 run 历史里就够
+            if let PushError::Failed(_) = err {
+                utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
+            }
             state.emit_source(source.kb_id);
             Err(utopia_core::AppError::Validation(msg).into())
         }
     }
+}
+
+/// 推陈述（0054）：请求体就是开放抽取契约（`e` / `s` / `n`），外加 `api` 推送的那层信封。
+///
+/// 和 `push` 同一把钥匙、同一套身份语义（`statements:{external_id}`）、同一份 run 记录；
+/// 不同的只有两点，都在门口定死：**载荷照原样成为文档，一整块**，抽取时按契约解析而不问
+/// 模型；**信封与契约之外的任何键都拒收**——契约里本来就没有属性、类或谓词的格子，
+/// 一个写了 `predicate` 的调用方应当在这里得到 422，而不是在图里找不到它以为写进去的类型事实。
+pub async fn push_statements(
+    State(state): State<AppState>,
+    Path(source_id): Path<Uuid>,
+    headers: HeaderMap,
+    bytes: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    let source = utopia_store::sources::get(&state.pool, source_id).await?;
+    if source.kind != "statements" {
+        return Err(utopia_core::AppError::NotFound.into());
+    }
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(utopia_core::AppError::Unauthorized)?;
+    if !push_key_matches(source.ingest_token.as_deref(), token) {
+        return Err(utopia_core::AppError::Unauthorized.into());
+    }
+
+    let run = utopia_store::sources::start_run(&state.pool, source.id).await?;
+    match handle_statements_push(&state, &source, &bytes).await {
+        Ok(action) => {
+            let (created, updated) = match action {
+                crate::ingest_sources::IngestAction::Created => (1, 0),
+                crate::ingest_sources::IngestAction::Updated
+                | crate::ingest_sources::IngestAction::Moved => (0, 1),
+                crate::ingest_sources::IngestAction::Unchanged
+                | crate::ingest_sources::IngestAction::Tombstoned
+                | crate::ingest_sources::IngestAction::Duplicate(_) => (0, 0),
+            };
+            utopia_store::sources::finish_run(&state.pool, run, source.id, None, created, updated)
+                .await?;
+            utopia_store::sources::finish_sync(&state.pool, source.id, None, created).await?;
+            state.emit_source(source.kb_id);
+            Ok(Json(action_reply(action)))
+        }
+        Err(err) => {
+            let msg = err.message().to_string();
+            utopia_store::sources::finish_run(&state.pool, run, source.id, Some(&msg), 0, 0)
+                .await?;
+            if let PushError::Failed(_) = err {
+                utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
+            }
+            state.emit_source(source.kb_id);
+            Err(utopia_core::AppError::Validation(msg).into())
+        }
+    }
+}
+
+/// 一次推送最多多少字节、多少条陈述。第一刀的上限，不是契约：一块就是一份载荷，
+/// 这两个数只是不让一份载荷大到审核卡片和证据视图没法呈现
+pub(crate) const STATEMENTS_MAX_BYTES: usize = 64 * 1024;
+const STATEMENTS_MAX_ITEMS: usize = 200;
+/// 信封里允许的键。契约的三个数组之外，只有 `api` 推送也有的那三个
+const STATEMENTS_ENVELOPE: [&str; 6] = ["external_id", "doc_time", "deleted", "e", "s", "n"];
+
+#[derive(serde::Deserialize)]
+struct StatementsBody {
+    external_id: String,
+    #[serde(default)]
+    doc_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    e: serde_json::Value,
+    #[serde(default)]
+    s: serde_json::Value,
+    #[serde(default)]
+    n: serde_json::Value,
+}
+
+/// 门口的校验：形状对不对、有没有契约之外的键、每条陈述的引文格是不是空的。
+/// 通过就按契约重新序列化成文档正文——存的是我们自己写出来的那份，不是调用方发来的
+/// 字节：身份、日期（有的话）和 `{e, s, n}`，键序固定、没有多余空白，块就是契约本身
+fn validate_statements_payload(raw: &[u8]) -> Result<(StatementsBody, Option<String>), String> {
+    if raw.len() > STATEMENTS_MAX_BYTES {
+        return Err(format!(
+            "payload is {} bytes; the limit is {STATEMENTS_MAX_BYTES}",
+            raw.len()
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| format!("Invalid JSON payload: {e}"))?;
+    let Some(map) = value.as_object() else {
+        return Err("the payload must be a JSON object".into());
+    };
+    if let Some(extra) = map
+        .keys()
+        .find(|k| !STATEMENTS_ENVELOPE.contains(&k.as_str()))
+    {
+        return Err(format!(
+            "unknown key {extra:?}: the contract has no slot for it (allowed: external_id, doc_time, deleted, e, s, n)"
+        ));
+    }
+    let body: StatementsBody =
+        serde_json::from_value(value).map_err(|e| format!("Invalid payload: {e}"))?;
+    if body.external_id.trim().is_empty() {
+        return Err("external_id is required".into());
+    }
+    if body.deleted {
+        return Ok((body, None));
+    }
+    let arrays = [("e", &body.e), ("s", &body.s), ("n", &body.n)];
+    for (key, v) in arrays {
+        if !v.is_array() {
+            return Err(format!("{key} must be an array"));
+        }
+    }
+    let statements = body.s.as_array().expect("checked above");
+    if statements.is_empty() {
+        return Err("s must hold at least one statement".into());
+    }
+    if statements.len() > STATEMENTS_MAX_ITEMS {
+        return Err(format!(
+            "{} statements; the limit is {STATEMENTS_MAX_ITEMS} per push",
+            statements.len()
+        ));
+    }
+    for (i, item) in statements.iter().enumerate() {
+        let Some(arr) = item.as_array() else {
+            return Err(format!("s[{i}] must be an array of eight slots"));
+        };
+        if arr.len() != 8 {
+            return Err(format!(
+                "s[{i}] has {} slots; the contract has eight",
+                arr.len()
+            ));
+        }
+        if !arr[0].is_null() {
+            return Err(format!(
+                "s[{i}][0] (quote) must be null: the item is its own evidence"
+            ));
+        }
+        if !arr[5].is_null() && !arr[5].is_object() {
+            return Err(format!("s[{i}][5] (qualifiers) must be an object or null"));
+        }
+    }
+    for (i, item) in body.n.as_array().expect("checked above").iter().enumerate() {
+        let Some(arr) = item.as_array() else {
+            return Err(format!("n[{i}] must be an array"));
+        };
+        if arr.len() > 2 && !arr[2].is_null() {
+            return Err(format!("n[{i}][2] (quote) must be null"));
+        }
+    }
+    // 存下的文档带着这次观测的身份和日期，再是契约的三个数组（#900）。身份在正文里，
+    // 两次看到同一件事就是两篇正文不同的文档：库里一份内容只能有一篇（`documents_kb_sha_idx`），
+    // 文件型来源那条「同内容出现在新路径 = 改名」的识别也就永远碰不到它。解析器只读
+    // `e` / `s` / `n`，多出的两个键它不看
+    // 只有契约能通过 parse_open_response：这一步在门口跑一遍，抽取时不会再有别的答案
+    let mut stored = serde_json::Map::new();
+    stored.insert("external_id".into(), json!(body.external_id.trim()));
+    if let Some(at) = body.doc_time {
+        stored.insert("doc_time".into(), json!(at));
+    }
+    stored.insert("e".into(), body.e.clone());
+    stored.insert("s".into(), body.s.clone());
+    stored.insert("n".into(), body.n.clone());
+    let content = serde_json::to_string_pretty(&serde_json::Value::Object(stored))
+        .map_err(|e| format!("cannot serialise the contract: {e}"))?;
+    let parsed = utopia_extract::open::parse_open_response(&content)
+        .map_err(|e| format!("the contract does not parse: {e}"))?;
+    if parsed.skipped > 0 {
+        return Err(format!(
+            "{} item(s) are malformed for the contract (e: [name, kind, named]; s: [null, subject, phrase, object, value, qualifiers, when, ended]; n: [entity, name, null])",
+            parsed.skipped
+        ));
+    }
+    if parsed.statements.is_empty() {
+        return Err("no statement survived parsing".into());
+    }
+    // 主语和别名所属的东西必须在 `e` 里（0054 决定 5）：抽取时找不到的会作为 UNKNOWN_REF
+    // 静默丢掉，而门口的职责就是不让调用方以为它写进去了。折叠规则与抽取的 `name_key`
+    // 同一条：只许空白和大小写不同。宾语不在此列——它落成字面值，陈述照落
+    let listed: std::collections::HashSet<String> = parsed
+        .entities
+        .iter()
+        .map(|e| crate::extraction_open::name_key(&e.name))
+        .collect();
+    for (i, st) in parsed.statements.iter().enumerate() {
+        if !listed.contains(&crate::extraction_open::name_key(&st.subject)) {
+            return Err(format!(
+                "s[{i}][1] (subject) {:?} is not a thing listed in e",
+                st.subject
+            ));
+        }
+    }
+    for (i, n) in parsed.names.iter().enumerate() {
+        if !listed.contains(&crate::extraction_open::name_key(&n.entity)) {
+            return Err(format!(
+                "n[{i}][0] (entity) {:?} is not a thing listed in e",
+                n.entity
+            ));
+        }
+    }
+    Ok((body, Some(content)))
+}
+
+async fn handle_statements_push(
+    state: &AppState,
+    source: &utopia_core::models::Source,
+    bytes: &[u8],
+) -> Result<crate::ingest_sources::IngestAction, PushError> {
+    let (body, content) = validate_statements_payload(bytes).map_err(PushError::Rejected)?;
+    let identity = body.external_id.trim().to_string();
+    let key = format!("statements:{identity}");
+    let Some(content) = content else {
+        utopia_store::documents::mark_missing_keys(&state.pool, source.id, &[key])
+            .await
+            .map_err(|e| PushError::Failed(e.to_string()))?;
+        return Ok(crate::ingest_sources::IngestAction::Tombstoned);
+    };
+    let filename = format!("{identity}.json");
+    let action = crate::ingest_sources::ingest_item_with_outcome(
+        state,
+        source.kb_id,
+        source.id,
+        &key,
+        crate::ingest_sources::Identity::Declared,
+        &filename,
+        "application/json",
+        content.as_bytes(),
+        body.doc_time,
+    )
+    .await
+    .map_err(|e| PushError::Failed(e.to_string()))?
+    .action;
+    if !matches!(action, crate::ingest_sources::IngestAction::Duplicate(_)) {
+        utopia_store::documents::clear_missing_keys(&state.pool, source.id, &[key])
+            .await
+            .map_err(|e| PushError::Failed(e.to_string()))?;
+    }
+    Ok(action)
 }
 
 /// 来源级全量重抽（增量语义）：该来源下所有 ready 文档重新过一遍抽取。
@@ -455,6 +851,15 @@ pub async fn re_extract(
     let source = utopia_store::sources::get(&state.pool, source_id).await?;
     if source.kb_id != kb_id {
         return Err(utopia_core::AppError::NotFound.into());
+    }
+    // `queue_extraction` 自己也会把这种来源的文档滤掉，那样这里回的是「排了 0 篇」。
+    // 点按钮的人该听到的是为什么
+    if !source.extracts() {
+        return Err(utopia_core::AppError::invalid(
+            "source_not_extracted",
+            "Documents under this source are searched, not extracted",
+        )
+        .into());
     }
     // 任务由 queue_extraction 与状态同事务建好，这里只负责推送
     let ids =
@@ -473,4 +878,98 @@ pub async fn re_extract(
     )
     .await;
     Ok(Json(json!({ "queued": ids.len() })))
+}
+
+#[cfg(test)]
+#[path = "sources_statements_tests.rs"]
+mod statements_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::{keep_secrets, validate_rss_config};
+    use serde_json::json;
+
+    /// 认证判断写反是这类改动唯一值得担心的事（`ct_eq` 给的是 `Choice` 不是
+    /// `bool`，判反一次就是全放行且一切看起来正常），所以两个方向都钉住
+    #[test]
+    fn only_the_key_itself_gets_in() {
+        let key = super::new_ingest_token();
+        assert!(super::push_key_matches(Some(&key), &key));
+        let mut off_by_one = key.clone();
+        off_by_one.pop();
+        off_by_one.push(if key.ends_with('a') { 'b' } else { 'a' });
+        assert!(
+            !super::push_key_matches(Some(&key), &off_by_one),
+            "one character off is not the key"
+        );
+        assert!(
+            !super::push_key_matches(Some(&key), &key[..key.len() - 1]),
+            "a prefix is not the key"
+        );
+        assert!(
+            !super::push_key_matches(Some(&key), &format!("{key}x")),
+            "the key with something after it is not the key"
+        );
+        assert!(
+            !super::push_key_matches(None, &key),
+            "a source that never had a key takes nobody's word"
+        );
+    }
+
+    #[test]
+    fn a_blank_or_missing_secret_keeps_the_stored_one() {
+        let existing = json!({ "bucket": "old", "secret_access_key": "s", "password": "p" });
+        // 没传 → 留；空串 → 留；有值 → 换；null → 删
+        let mut next = json!({ "bucket": "new", "password": "  ", "token": null });
+        keep_secrets(&mut next, &existing);
+        assert_eq!(next["bucket"], "new");
+        assert_eq!(
+            next["secret_access_key"], "s",
+            "missing keeps the stored value"
+        );
+        assert_eq!(next["password"], "p", "blank keeps the stored value");
+        assert!(next.get("token").is_none(), "an explicit null removes it");
+        let mut next = json!({ "secret_access_key": "fresh" });
+        keep_secrets(&mut next, &existing);
+        assert_eq!(next["secret_access_key"], "fresh");
+        assert_eq!(next["password"], "p");
+    }
+
+    #[test]
+    fn no_secret_reaches_a_response() {
+        let source = utopia_core::models::Source {
+            id: uuid::Uuid::nil(),
+            kb_id: uuid::Uuid::nil(),
+            kind: "s3".into(),
+            name: "s".into(),
+            config: json!({ "bucket": "b", "access_key_id": "AKIA", "secret_access_key": "x",
+                            "account_key": "y", "service_account_key": "z", "password": "w",
+                            "token": "t", "auth_header": "h" }),
+            icon: None,
+            sync_interval_minutes: None,
+            sync_cron: None,
+            last_sync_at: None,
+            last_sync_status: "never".into(),
+            last_sync_error: None,
+            last_sync_added: 0,
+            ingest_token: Some("utp_x".into()),
+            created_at: chrono::Utc::now(),
+        };
+        let masked = super::mask_secrets(source);
+        let obj = masked.config.as_object().unwrap();
+        for key in utopia_core::models::SOURCE_SECRET_KEYS {
+            assert!(!obj.contains_key(*key), "{key} leaked");
+        }
+        assert_eq!(obj["bucket"], "b");
+        assert_eq!(
+            obj["access_key_id"], "AKIA",
+            "an identifier is not a secret"
+        );
+    }
+
+    #[test]
+    fn invalid_rss_content_mode_is_rejected_at_the_route_boundary() {
+        assert!(validate_rss_config("rss", &json!({ "content_mode": "all" })).is_err());
+        assert!(validate_rss_config("url", &json!({ "content_mode": "all" })).is_ok());
+    }
 }

@@ -27,6 +27,18 @@ pub async fn record(
     .await
 }
 
+/// 令牌代人做的动作在 detail 里记下是哪一枚（0014 决定 6）：撤销之前，管理员要查得出
+/// 这枚令牌做过什么。会话来的（None）原样返回
+pub fn via_token(mut detail: serde_json::Value, token_id: Option<Uuid>) -> serde_json::Value {
+    if let (Some(token_id), Some(fields)) = (token_id, detail.as_object_mut()) {
+        fields.insert(
+            "token_id".into(),
+            serde_json::Value::String(token_id.to_string()),
+        );
+    }
+    detail
+}
+
 /// 请求的来源信息。由 HTTP 层在每个请求外层 scope 进 [`CLIENT`]，`record_opt`
 /// 自行读取——否则 25 个调用点每一个都要多带两个与业务无关的参数。
 ///
@@ -101,9 +113,9 @@ pub async fn review_history(
                         OR e.action LIKE 'conflict.%' OR e.action LIKE 'merge.%')";
     let rows: Vec<AuditEventView> = sqlx::query_as(&format!(
         "SELECT e.id, e.action, e.target_kind, e.target_id, e.detail,
-                u.display_name AS actor_name, e.created_at
+                e.actor_id, u.display_name AS actor_name, e.created_at
          FROM audit_events e LEFT JOIN users u ON u.id = e.actor_id
-         WHERE {COND} ORDER BY e.created_at DESC LIMIT $2 OFFSET $3"
+         WHERE {COND} ORDER BY e.created_at DESC, e.id DESC LIMIT $2 OFFSET $3"
     ))
     .bind(kb_id)
     .bind(limit)
@@ -152,10 +164,10 @@ pub async fn list_for_kb(
 
     let rows: Vec<AuditEventView> = sqlx::query_as(&format!(
         "SELECT e.id, e.action, e.target_kind, e.target_id, e.detail,
-                u.display_name AS actor_name, e.created_at
+                e.actor_id, u.display_name AS actor_name, e.created_at
          FROM audit_events e LEFT JOIN users u ON u.id = e.actor_id
          {WHERE}
-         ORDER BY e.created_at DESC LIMIT $6 OFFSET $7"
+         ORDER BY e.created_at DESC, e.id DESC LIMIT $6 OFFSET $7"
     ))
     .bind(kb_id)
     .bind(action)

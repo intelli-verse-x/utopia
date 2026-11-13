@@ -35,26 +35,56 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash)
-        .map(|parsed| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
-        })
-        .unwrap_or(false)
+    // 单点登录开的账号存的是 `!`，解析不了。照样跑一遍 argon2（对着 dummy），
+    // 否则响应快得多，能据此分辨出哪些账号只走 SSO
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        let dummy = PasswordHash::new(dummy_password_hash()).expect("the dummy parses");
+        let _ = Argon2::default().verify_password(password.as_bytes(), &dummy);
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// 「邮箱不存在」分支用的常量时间伙伴：一个用真实参数算出来的 argon2 哈希，明文是随机
+/// 字节、算完即弃。要点只有一个——它必须能被 `PasswordHash::new` 解析并带着与
+/// `hash_password` 相同的参数，这样那条分支和「邮箱存在、密码错」走的是同一段计算。
+/// 它不匹配任何口令；结果本来就被丢弃。从 `hash_password` 派生而不是硬编码，是为了
+/// 参数永不漂移：`Argon2::default()` 一变，这里跟着变，没有测试会静静过时。
+pub fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use argon2::password_hash::rand_core::RngCore;
+        let mut bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        let plaintext: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        hash_password(&plaintext).expect("hashing random bytes cannot fail")
+    })
 }
 
 pub fn issue_token(state: &AppState, user_id: Uuid) -> Result<String, AppError> {
+    issue_session(state, user_id).map(|(token, _)| token)
+}
+
+/// 签发会话并给出它的过期时刻：要把过期时间告诉调用方的地方用这个，
+/// 免得在别处再按 TTL 算一遍、和 JWT 里的 `exp` 对不上
+pub fn issue_session(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(String, chrono::DateTime<Utc>), AppError> {
+    let expires_at = Utc::now() + chrono::Duration::days(TOKEN_TTL_DAYS);
     let claims = Claims {
         sub: user_id,
-        exp: (Utc::now() + chrono::Duration::days(TOKEN_TTL_DAYS)).timestamp(),
+        exp: expires_at.timestamp(),
     };
-    encode(
+    let token = encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
     )
-    .map_err(|e| AppError::Other(anyhow::anyhow!("Token issuance failed: {e}")))
+    .map_err(|e| AppError::Other(anyhow::anyhow!("Token issuance failed: {e}")))?;
+    Ok((token, expires_at))
 }
 
 /// 外层是否在跑 TLS。反代都会带 `X-Forwarded-Proto`；没有这个头（本地直连、
@@ -107,6 +137,22 @@ pub(crate) fn decode_user_id(state: &AppState, token: &str) -> Result<Uuid, AppE
     Ok(data.claims.sub)
 }
 
+/// 请求带来的凭据：Cookie `utopia_token` 优先，其次 `Authorization: Bearer`。
+fn presented_credential(parts: &Parts) -> Result<String, AppError> {
+    CookieJar::from_headers(&parts.headers)
+        .get(COOKIE_NAME)
+        .map(|c| c.value().to_string())
+        .or_else(|| {
+            parts
+                .headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|v| v.to_string())
+        })
+        .ok_or(AppError::Unauthorized)
+}
+
 /// 已登录用户提取器：Cookie `utopia_token` 或 `Authorization: Bearer`。
 pub struct AuthUser(pub User);
 
@@ -117,25 +163,88 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let jar = CookieJar::from_headers(&parts.headers);
-        let token = jar
-            .get(COOKIE_NAME)
-            .map(|c| c.value().to_string())
-            .or_else(|| {
-                parts
-                    .headers
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.strip_prefix("Bearer "))
-                    .map(|v| v.to_string())
-            })
-            .ok_or(AppError::Unauthorized)?;
-
+        let token = presented_credential(parts)?;
         let user_id = decode_user_id(state, &token)?;
         let user = utopia_store::accounts::find_user_by_id(&state.pool, user_id)
             .await?
             .ok_or(AppError::Unauthorized)?;
         Ok(AuthUser(user))
+    }
+}
+
+/// 会话或个人令牌，二者都落到同一个 `User` 上（0014 决定 6，#1243）。
+///
+/// **不替换 `AuthUser`。** `AuthUser` 把每个 Bearer 都当 JWT 解，令牌在那几百条
+/// 路由上一律是 401——那是有意的：哪条路由准令牌进来，要在 0014 里说出理由。
+/// 用这个提取器的只有文档原件（0052）、「把一个库搭起来」那几条和读图那几条：搜实体、
+/// 实体详情、认知历史、事实证据、图总览、邻域（决定 7）。
+///
+/// 令牌只收窄：`pat` 在的时候，路由先问 [`Self::require_write`] 或
+/// [`Self::reaches`]，角色照旧由 `require_kb` 与工作区角色判。
+pub struct SessionOrToken {
+    pub user: User,
+    /// None = 网页会话，不收窄任何东西
+    pub pat: Option<utopia_store::tokens::Authenticated>,
+}
+
+impl FromRequestParts<AppState> for SessionOrToken {
+    type Rejection = ApiErr;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let raw = presented_credential(parts)?;
+        // 过期与撤销在 `authenticate` 的 SQL 里判；停用的人 `find_user_by_id` 挡住
+        let (user_id, pat) = if raw.starts_with(utopia_store::tokens::PREFIX) {
+            let pat = utopia_store::tokens::authenticate(&state.pool, raw.trim()).await?;
+            (pat.user_id, Some(pat))
+        } else {
+            (decode_user_id(state, &raw)?, None)
+        };
+        let user = utopia_store::accounts::find_user_by_id(&state.pool, user_id)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        Ok(Self { user, pat })
+    }
+}
+
+impl SessionOrToken {
+    /// 代人行事的那枚令牌；会话是 None。审计行靠它分得出是哪一枚（0014 决定 6）
+    pub fn token_id(&self) -> Option<Uuid> {
+        self.pat.as_ref().map(|pat| pat.token_id)
+    }
+
+    /// 令牌有没有把这个库排除掉。会话什么都不排除；这不是权限，权限归角色
+    pub fn reaches(&self, kb_id: Uuid) -> bool {
+        self.pat.as_ref().is_none_or(|pat| pat.covers(kb_id))
+    }
+
+    /// 令牌准不准往这个库里写。`None` 是一个还不存在的库：限定过 `kb_ids` 的令牌
+    /// 列表里不可能有它，所以建库只给不限库的令牌。
+    ///
+    /// 两种拒绝各带 code：它们都是「换一枚令牌就行」，与角色不够的 403 不是一回事
+    pub fn require_write(&self, kb_id: Option<Uuid>) -> Result<(), AppError> {
+        let Some(pat) = &self.pat else {
+            return Ok(());
+        };
+        if !pat.can_write() {
+            return Err(AppError::CodedForbidden {
+                code: "token_read_only",
+                message: "This token is read-only; issue one with the write scope".into(),
+            });
+        }
+        let in_scope = match kb_id {
+            Some(kb_id) => pat.covers(kb_id),
+            None => pat.kb_ids.is_none(),
+        };
+        if !in_scope {
+            return Err(AppError::CodedForbidden {
+                code: "token_kb_out_of_scope",
+                message: "This token reaches only the knowledge bases it lists".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -238,5 +347,26 @@ mod tests {
 
         // 配置强制打开：给不发这个头的代理兜底
         assert!(behind_tls(&headers_with(None), true));
+    }
+
+    /// 「邮箱不存在」分支用的 dummy 哈希：唯一要紧的属性是它和真实哈希用同一套参数，
+    /// 这样两条分支跑的是同一段 argon2 计算。明文是什么无关紧要——`verify_password`
+    /// 解析成功后就完整跑一遍，匹配与否都花同样的时间
+    #[test]
+    fn the_dummy_hash_costs_the_same_as_a_real_one() {
+        let dummy = PasswordHash::new(dummy_password_hash()).expect("the dummy parses");
+        let real_str = hash_password("anything").unwrap();
+        let real = PasswordHash::new(&real_str).unwrap();
+        assert_eq!(dummy.algorithm, real.algorithm);
+        assert_eq!(
+            dummy.params, real.params,
+            "the dummy must cost what a real verify costs"
+        );
+        assert_eq!(
+            dummy.salt.map(|s| s.len()),
+            real.salt.map(|s| s.len()),
+            "same salt length as a real hash"
+        );
+        assert!(!verify_password("anything", dummy_password_hash()));
     }
 }

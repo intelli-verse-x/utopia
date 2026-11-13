@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { api, type ChunkFact } from "../api";
+import { api, type ChunkFact, type Doc } from "../api";
 import { S } from "../i18n";
 import { useKbId } from "../kb";
-import { Pager, pageSlice } from "../ui";
+import { originHint, originLabel } from "../origin";
+import { fmtTime } from "../time";
+import { GroupLabel, LinkButton, PageHeader, Pager, pageSlice } from "../ui";
+import { AddOntologyRegressionDialog } from "./AddOntologyRegressionDialog";
+import { QuotedText } from "../ui/citation";
 import { SourcesRail } from "./SourcesRail";
 
 const DOC_PAGE = 12;
@@ -18,13 +22,21 @@ function factRange(f: ChunkFact): string | null {
 
 export function DocViewer() {
   const kbId = useKbId();
+  const [caseStatement, setCaseStatement] = useState<ChunkFact | null>(null);
   const { docId } = useParams({ from: "/app/kb/$kbId/doc/$docId" });
-  const { chunk } = useSearch({ from: "/app/kb/$kbId/doc/$docId" });
+  const { chunk, quote } = useSearch({ from: "/app/kb/$kbId/doc/$docId" });
   const navigate = useNavigate();
 
   const detail = useQuery({
     queryKey: ["docDetail", docId],
     queryFn: () => api.documentDetail(docId),
+  });
+  // 角色仅详情接口返回；复用 KbScope 的键，不能从工作区 KB 列表判断写权限。
+  const roleKbId = detail.data?.document.kb_id;
+  const role = useQuery({
+    queryKey: ["kbOne", roleKbId],
+    queryFn: () => api.kbDetail(roleKbId!),
+    enabled: !!roleKbId,
   });
   // 反向证据链：各分块抽出的事实（一次取整文档，按 chunk 分组）
   const extractions = useQuery({
@@ -43,6 +55,7 @@ export function DocViewer() {
   // null = 自动定位：有引用跳转时翻到目标分块所在页
   const [page, setPage] = useState<number | null>(null);
   useEffect(() => setPage(null), [chunk, docId]);
+  useEffect(() => setCaseStatement(null), [docId]);
 
   const highlightRef = useRef<HTMLDivElement>(null);
   // 引用跳转：滚动到目标分块点亮一下，稍候淡出恢复普通状态（不常驻高亮）
@@ -58,10 +71,10 @@ export function DocViewer() {
   }, [detail.data, chunk]);
 
   if (detail.isPending)
-    return <div className="p-8 text-sm text-neutral-500">{S.doc.loading}</div>;
+    return <div className="p-8 text-body text-ink-2">{S.doc.loading}</div>;
   if (detail.isError)
     return (
-      <div className="p-8 text-sm text-rose-400">
+      <div className="p-8 text-body text-danger">
         {(detail.error as Error).message}
       </div>
     );
@@ -80,19 +93,18 @@ export function DocViewer() {
         onSelect={(sel) => navigate({ to: "/kb/$kbId/library", params: { kbId }, search: { src: sel } })}
       />
       <div className="flex-1 min-w-0 overflow-y-auto u-scroll">
-        <div className="max-w-4xl mx-auto p-6">
-        <div className="mb-4 flex items-baseline justify-between gap-4">
-          <div>
-            <h2 className="text-lg font-bold text-neutral-100 break-all">{doc.filename}</h2>
-            <p className="mt-0.5 text-xs text-neutral-500">
-              {chunks.length} {S.doc.sections} · {(doc.size_bytes / 1024).toFixed(0)} KB ·{" "}
-              {new Date(doc.created_at).toLocaleDateString()}
-            </p>
-          </div>
-          <Link to="/kb/$kbId/library" params={{ kbId }} className="shrink-0 text-sm text-[var(--u-accent)] hover:underline">
-            {S.doc.backToLibrary}
-          </Link>
-        </div>
+        {/* 靠左排，与文库列表同一个内距（px-8 py-6），铺满栏右的整个宽度：
+            分块那一栏和右边的抽取栏一起摊开 */}
+        <div className="px-8 py-6">
+        <PageHeader
+          title={doc.filename}
+          sub={<DocMeta doc={doc} chunks={chunks.length} />}
+          actions={
+            <Link to="/kb/$kbId/library" params={{ kbId }} className="u-link shrink-0 text-body">
+              {S.doc.backToLibrary}
+            </Link>
+          }
+        />
 
         <div className="space-y-3">
           {pagedChunks.map((c) => {
@@ -101,15 +113,22 @@ export function DocViewer() {
             return (
               <div key={c.id} ref={hit ? highlightRef : undefined} className="flex gap-3">
                 <div
-                  className={`flex-1 min-w-0 rounded-xl border p-4 text-sm leading-relaxed whitespace-pre-wrap border-white/10 transition-[border-color,background-color,box-shadow] duration-700 ${
-                    hit && flash ? "u-flash" : "bg-white/[0.04]"
+                  className={`u-chunk flex-1 min-w-0 rounded-panel border p-4 text-body leading-relaxed whitespace-pre-wrap border-line ${
+                    hit && flash ? "u-flash" : "bg-surface"
                   }`}
                 >
-                  <div className="mb-1.5 text-xs text-neutral-500">
+                  <div className="mb-2 text-small text-ink-2">
                     {S.doc.section} {c.seq + 1}
+                    {/* 认出来、转写出来的字标一句出处：可能认错一个数、听错一个名字 */}
+                    {originLabel(c.origin, c.anchor) && (
+                      <span title={originHint(c.origin, c.origin_model)}>
+                        {" · "}
+                        {originLabel(c.origin, c.anchor)}
+                      </span>
+                    )}
                     {hit && (
                       <span
-                        className={`ml-2 text-[var(--u-accent)] transition-opacity duration-700 ${
+                        className={`u-fade-slow ml-2 text-accent ${
                           flash ? "opacity-100" : "opacity-0"
                         }`}
                       >
@@ -117,34 +136,43 @@ export function DocViewer() {
                       </span>
                     )}
                   </div>
-                  {c.text}
+                  {/* 从一条图谱事实的号跳来时，标出说出它的那一句（#968 的后续） */}
+                  {hit && quote ? <QuotedText text={c.text} quotes={[quote]} /> : c.text}
                 </div>
 
-                {/* 抽取对照栏：这个分块产出了哪些事实（实体可跳图谱） */}
+                {/* 抽取对照栏：这个分块产出了哪些事实（实体可跳图谱）。
+                    **宽度跟着屏幕走**：每一条都是一个三元组，窄栏里一条要折三行，
+                    读者要在原文和它之间来回看，折行越多越难对上。384 的时候大多数
+                    三元组占一到两行 */}
                 {facts.length > 0 && (
-                  <aside className="w-64 shrink-0 rounded-xl border border-white/10 bg-white/[0.02] p-3">
-                    <div className="mb-2 text-[10px] font-medium uppercase tracking-[0.08em] text-neutral-600">
-                      {S.doc.extracted} · {facts.length}
-                    </div>
-                    <div className="space-y-2">
+                  <aside className="w-64 shrink-0 rounded-panel border border-line bg-surface p-3 xl:w-80 2xl:w-96">
+                    <GroupLabel className="mb-2" count={facts.length}>
+                      {S.doc.extracted}
+                    </GroupLabel>
+                    {/* **条与条之间画一条线**：一条折了三行、下一条折了两行，只靠 8px 的
+                        间距分不开，一栏读下来是一团字。线比加大间距省地方 */}
+                    <div className="divide-y divide-line">
                       {facts.map((f) => {
                         const range = factRange(f);
                         return (
-                          <div key={f.fact_id} className="text-xs leading-snug">
+                          <div
+                            key={f.fact_id}
+                            className="py-2 text-small leading-snug first:pt-0 last:pb-0"
+                          >
                             <div>
                               <Link
                                 to="/kb/$kbId/graph"
                                 params={{ kbId }}
                                 search={{ entity: f.subject_id }}
-                                className="text-neutral-200 hover:text-white hover:underline underline-offset-2 decoration-white/30"
+                                className="u-inline-link text-ink"
                               >
                                 {f.subject}
                               </Link>
                               <span
                                 className={
                                   f.predicate === null
-                                    ? "italic text-neutral-700"
-                                    : "text-neutral-600"
+                                    ? "italic text-ink-2"
+                                    : "text-ink-2"
                                 }
                                 title={
                                   f.predicate && f.inferred
@@ -160,15 +188,24 @@ export function DocViewer() {
                                   to="/kb/$kbId/graph"
                                   params={{ kbId }}
                                   search={{ entity: f.object_id }}
-                                  className="text-neutral-200 hover:text-white hover:underline underline-offset-2 decoration-white/30"
+                                  className="u-inline-link text-ink"
                                 >
                                   {f.object}
                                 </Link>
                               ) : (
-                                <span className="text-neutral-300">{f.object ?? ""}</span>
+                                /* 字面值的宾语与实体的宾语**一样深**：浅一档的话它和
+                                   中间的短语同色，三元组读起来就断不开哪里是关系、
+                                   哪里是值 */
+                                <span className="text-ink">{f.object ?? ""}</span>
                               )}
                             </div>
-                            {range && <div className="u-num text-[10.5px] text-neutral-500">{range}</div>}
+                            {range && <div className="u-num text-fine text-ink-2">{range}</div>}
+                            {f.is_open_statement &&
+                              ["editor", "admin", "owner"].includes(role.data?.my_role ?? "") && (
+                              <LinkButton className="mt-1 text-fine" onClick={() => setCaseStatement(f)}>
+                                {S.ontology.caseMake}
+                              </LinkButton>
+                            )}
                           </div>
                         );
                       })}
@@ -182,6 +219,40 @@ export function DocViewer() {
           <Pager total={chunks.length} pageSize={DOC_PAGE} page={safePage} onPage={setPage} />
         </div>
       </div>
+      {caseStatement && (
+        <AddOntologyRegressionDialog
+          key={caseStatement.fact_id}
+          kbId={doc.kb_id}
+          statementId={caseStatement.fact_id}
+          statement={`${caseStatement.subject} ${caseStatement.predicate ?? ""} ${caseStatement.object ?? ""}`}
+          isValue={!caseStatement.object_id}
+          onClose={() => setCaseStatement(null)}
+        />
+      )}
     </div>
+  );
+}
+
+/** 文档头部的元数据条：段数 · 大小 · 文档日期 · 上传时刻。
+ *
+ *  文档日期（`doc_time`）与上传时刻（`created_at`）分开显示（#610）：合成一格，读的人会把
+ *  上传时间当成文档上写的日期。两者的读法也不同：文档日期是**日历日期**，存的是那一天的
+ *  UTC 午夜，按 UTC 读（`fmtTime`）——按本地读，UTC-5 的人看到的是前一天；上传时刻是一个
+ *  真实的时刻，按看的人所在的时区读。 */
+function DocMeta({ doc, chunks }: { doc: Doc; chunks: number }) {
+  const docDate = fmtTime(doc.doc_time, "day");
+  return (
+    <>
+      {chunks} {S.doc.sections} · {(doc.size_bytes / 1024).toFixed(0)} KB ·{" "}
+      {docDate && (
+        <>
+          <span title={S.doc.docDateFromContent}>
+            {S.doc.docDate}: {docDate}
+          </span>
+          {" · "}
+        </>
+      )}
+      {S.doc.uploadedAt} {new Date(doc.created_at).toLocaleDateString()}
+    </>
   );
 }
