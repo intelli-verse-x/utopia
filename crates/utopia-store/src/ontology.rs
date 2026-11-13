@@ -1,10 +1,11 @@
 //! 本体编辑器仓储：类型/关系 CRUD（带使用量与删除保护）+ 未匹配统计。
 
 use pgvector::Vector;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use std::collections::HashSet;
 use utopia_core::models::{
-    EntityInstance, EntityTypeView, OntologyImportView, OntologyMiss, RelationAxioms,
-    RelationTypeView, TypeCandidate,
+    EntityInstance, EntityTypeView, OntologyImportView, RelationAxioms, RelationTypeView,
+    TypeCandidate,
 };
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
@@ -18,45 +19,188 @@ pub async fn entity_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Enti
                   WHERE p.child_id = t.id AND p.is_primary) AS primary_parent,
                 ARRAY(SELECT d.b_id FROM entity_type_disjoint d
                       WHERE d.kb_id = t.kb_id AND d.a_id = t.id) AS disjoint,
-                (SELECT count(*) FROM entities e
-                 WHERE e.type_id = t.id AND e.merged_into IS NULL) AS usage
-         FROM entity_types t WHERE t.kb_id = $1 ORDER BY lower(t.label)",
+                COALESCE(u.usage, 0) AS usage
+         FROM entity_types t
+         LEFT JOIN (
+             SELECT type_id, count(*)::bigint AS usage
+             FROM entities
+             WHERE kb_id = $1 AND merged_into IS NULL AND type_id IS NOT NULL
+             GROUP BY type_id
+         ) u ON u.type_id = t.id
+         WHERE t.kb_id = $1 ORDER BY lower(t.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
     .await?)
 }
 
+/// 「缺这条关系」看实体在哪一端：Out = 它是主语，In = 它是宾语，Either = 哪端都算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkEnd {
+    Out,
+    In,
+    Either,
+}
+
+/// 一个谓词在库里能以哪些样子出现，按「实体是关系的主语」这一端说。
+///
+/// 类型化行写的是属性；开放陈述写的是文档的短语，绑定（`phrase_bindings`）说哪些短语
+/// 算这个属性、哪个方向。逆关系与对称关系把「主语」翻成「宾语」：`A parentOf B` 就是
+/// `B childOf A`，所以缺 parentOf 的 A 也得没有一条「X childOf A」。
+#[derive(Debug, Clone)]
+pub struct LinkPredicate {
+    /// 谓词是本体里某个属性的 key 时，那个属性
+    pub relation_type_id: Option<Uuid>,
+    along: Vec<Uuid>,
+    against: Vec<Uuid>,
+    phrases_along: Vec<String>,
+    phrases_against: Vec<String>,
+}
+
+impl LinkPredicate {
+    /// 认作这个谓词的全部短语（归一过的），两个方向合在一起
+    pub fn phrases(&self) -> Vec<String> {
+        let mut all = [self.phrases_along.clone(), self.phrases_against.clone()].concat();
+        all.sort();
+        all.dedup();
+        all
+    }
+}
+
+/// 把一个谓词（属性的 key，或者一个开放短语）解析成它在库里的各种写法。
+pub async fn link_predicate(
+    pool: &PgPool,
+    kb_id: Uuid,
+    predicate: &str,
+) -> AppResult<LinkPredicate> {
+    let (relation_type_id, against, mut phrases_along, phrases_against): (
+        Option<Uuid>,
+        Vec<Uuid>,
+        Vec<String>,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "WITH r AS (SELECT id, inverse_of, is_symmetric FROM relation_types
+                     WHERE kb_id = $1 AND key = $2),
+              inv AS (SELECT x.id FROM relation_types x, r
+                       WHERE x.kb_id = $1 AND (x.id = r.inverse_of OR x.inverse_of = r.id)
+                      UNION SELECT id FROM r WHERE is_symmetric),
+              b AS (SELECT phrase, direction = 'forward' AS fwd,
+                           relation_type_id IN (SELECT id FROM r) AS on_r,
+                           relation_type_id IN (SELECT id FROM inv) AS on_inv
+                      FROM phrase_bindings
+                     WHERE kb_id = $1 AND status = 'bound')
+         SELECT (SELECT id FROM r),
+                ARRAY(SELECT id FROM inv),
+                ARRAY(SELECT DISTINCT phrase FROM b
+                       WHERE (on_r AND fwd) OR (on_inv AND NOT fwd)),
+                ARRAY(SELECT DISTINCT phrase FROM b
+                       WHERE (on_r AND NOT fwd) OR (on_inv AND fwd))",
+    )
+    .bind(kb_id)
+    .bind(predicate)
+    .fetch_one(pool)
+    .await?;
+    phrases_along.push(crate::phrase_bindings::normalize(predicate));
+    Ok(LinkPredicate {
+        relation_type_id,
+        along: relation_type_id.into_iter().collect(),
+        against,
+        phrases_along,
+        phrases_against,
+    })
+}
+
+/// 只列缺某条关系的成员（#1269）：没有一条活着的事实（断言、陈述或派生）按这个谓词连着它。
+#[derive(Debug, Clone, Copy)]
+pub struct Lacking<'a> {
+    pub predicate: &'a LinkPredicate,
+    pub end: LinkEnd,
+}
+
+impl Lacking<'_> {
+    /// 实体当主语时认哪些 (属性, 短语)，当宾语时认哪些
+    fn arms(&self) -> [(Vec<Uuid>, Vec<String>); 2] {
+        let p = self.predicate;
+        let along = (p.along.clone(), p.phrases_along.clone());
+        let against = (p.against.clone(), p.phrases_against.clone());
+        match self.end {
+            LinkEnd::Out => [along, against],
+            LinkEnd::In => [against, along],
+            LinkEnd::Either => {
+                let both = ([along.0, against.0].concat(), [along.1, against.1].concat());
+                [both.clone(), both]
+            }
+        }
+    }
+}
+
+/// 一端一个 NOT EXISTS，各自走 (kb_id, subject_id) / (kb_id, object_id) 的活行索引
+fn lacking_sql() -> String {
+    let phrase = crate::phrase_bindings::phrase_sql("f.phrase");
+    ["subject", "object"]
+        .iter()
+        .zip([("$3", "$4"), ("$5", "$6")])
+        .map(|(end, (ids, phrases))| {
+            format!(
+                " AND NOT EXISTS (SELECT 1 FROM facts f
+                    WHERE f.kb_id = e.kb_id AND f.{end}_id = e.id AND f.invalidated_at IS NULL
+                      AND (f.predicate_id = ANY({ids})
+                           OR (f.layer = 'open' AND {phrase} = ANY({phrases}))))
+                  AND NOT EXISTS (SELECT 1 FROM derived_facts d
+                    WHERE d.kb_id = e.kb_id AND d.{end}_id = e.id AND d.invalidated_at IS NULL
+                      AND d.predicate_id = ANY({ids}))"
+            )
+        })
+        .collect()
+}
+
 /// 某个类下的实体实例（按名称序，分页）。返回 (rows, total)。
+/// 给了 `lacking` 就只留缺那条关系的成员，页与总数按同一个条件数。
 pub async fn entity_instances(
     pool: &PgPool,
     kb_id: Uuid,
     type_id: Uuid,
+    lacking: Option<Lacking<'_>>,
     limit: i64,
     offset: i64,
 ) -> AppResult<(Vec<EntityInstance>, i64)> {
-    let rows: Vec<EntityInstance> = sqlx::query_as(
+    // 没给 lacking 时 $3..$6 是空数组，条件里不引用它们
+    let [(subject_ids, subject_phrases), (object_ids, object_phrases)] =
+        lacking.map(|l| l.arms()).unwrap_or_default();
+    let condition = format!(
+        "e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL{}",
+        lacking.map(|_| lacking_sql()).unwrap_or_default()
+    );
+    let rows: Vec<EntityInstance> = sqlx::query_as(&format!(
         "SELECT e.id, e.canonical_name AS name,
                 (SELECT count(*) FROM facts f
-                 WHERE (f.subject_id = e.id OR f.object_id = e.id)
-                   AND f.invalidated_at IS NULL) AS fact_count
+                  WHERE f.kb_id = e.kb_id
+                    AND (f.subject_id = e.id OR f.object_id = e.id)
+                    AND f.invalidated_at IS NULL) AS fact_count
          FROM entities e
-         WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL
-         ORDER BY lower(e.canonical_name)
-         LIMIT $3 OFFSET $4",
-    )
+         WHERE {condition}
+         ORDER BY lower(e.canonical_name), e.id
+         LIMIT $7 OFFSET $8"
+    ))
     .bind(kb_id)
     .bind(type_id)
+    .bind(&subject_ids)
+    .bind(&subject_phrases)
+    .bind(&object_ids)
+    .bind(&object_phrases)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    let (total,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM entities e
-         WHERE e.kb_id = $1 AND e.type_id = $2 AND e.merged_into IS NULL",
-    )
+    let (total,): (i64,) = sqlx::query_as(&format!(
+        "SELECT count(*) FROM entities e WHERE {condition}"
+    ))
     .bind(kb_id)
     .bind(type_id)
+    .bind(&subject_ids)
+    .bind(&subject_phrases)
+    .bind(&object_ids)
+    .bind(&object_phrases)
     .fetch_one(pool)
     .await?;
     Ok((rows, total))
@@ -82,13 +226,61 @@ pub async fn relation_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Re
                       WHERE d.relation_type_id = r.id) AS domains,
                 ARRAY(SELECT g.entity_type_id FROM relation_type_ranges g
                       WHERE g.relation_type_id = r.id) AS ranges,
-                (SELECT count(*) FROM facts f
-                 WHERE f.predicate_id = r.id AND f.invalidated_at IS NULL) AS usage
-         FROM relation_types r WHERE r.kb_id = $1 ORDER BY lower(r.label)",
+                ARRAY(SELECT q.qualifier_type_id FROM relation_type_qualifiers q
+                      WHERE q.relation_type_id = r.id) AS qualifiers,
+                COALESCE(u.usage, 0) AS usage
+         FROM relation_types r
+         LEFT JOIN (
+             SELECT predicate_id, count(*)::bigint AS usage
+             FROM facts
+             WHERE kb_id = $1 AND invalidated_at IS NULL AND predicate_id IS NOT NULL
+             GROUP BY predicate_id
+         ) u ON u.predicate_id = r.id
+         WHERE r.kb_id = $1 ORDER BY lower(r.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
     .await?)
+}
+
+/// 谓词的显示名统一成**小驼峰**（见迁移 0042）。
+///
+/// 类是大驼峰、谓词是小驼峰，这是 RDF/OWL 与 schema.org 的惯例，而且大小写
+/// 本身就在说这个词是类还是属性。库里同时存在 `acceptedAnswer`、`access to`、
+/// `ApplicableCertificate` 三种写法，在同一列里读起来就是没规矩。
+///
+/// **只动分隔符与首字母，不碰词内部的大小写**：`productID`、`hasLEI`、
+/// `accessibilityAPI` 要原样留着。从 `key` 反推是做不到这一点的——`to_key`
+/// 在连续大写之间不插下划线，`product_id` 拼回去只会得到 `productId`。
+pub fn lower_camel(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut start_of_word = false;
+    for c in label.trim().chars() {
+        if c == ' ' || c == '_' || c == '-' {
+            // 连着几个分隔符只算一次，词首标记留着
+            start_of_word = !out.is_empty();
+            continue;
+        }
+        if out.is_empty() {
+            out.extend(c.to_lowercase());
+        } else if start_of_word {
+            out.extend(c.to_uppercase());
+            start_of_word = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `temporal` 只有三个值（0031）：单条建、单条改、批量建、重导入更新都走这一句
+fn validate_temporal(temporal: &str) -> AppResult<()> {
+    if !matches!(temporal, "state" | "event" | "eternal") {
+        return Err(AppError::Validation(
+            "temporal must be state / event / eternal".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_key(key: &str) -> AppResult<()> {
@@ -107,8 +299,8 @@ fn validate_key(key: &str) -> AppResult<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_entity_type(
-    pool: &PgPool,
+pub async fn create_entity_type<'a>(
+    pool: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
     kb_id: Uuid,
     key: &str,
     label: &str,
@@ -119,6 +311,7 @@ pub async fn create_entity_type(
 ) -> AppResult<Uuid> {
     validate_key(key)?;
     validate_shape(shape)?;
+    let mut tx = pool.begin().await?;
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO entity_types (id, kb_id, key, label, color, shape, description)
@@ -131,7 +324,7 @@ pub async fn create_entity_type(
     .bind(color)
     .bind(shape)
     .bind(description)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -139,7 +332,8 @@ pub async fn create_entity_type(
         }
         _ => AppError::Db(e),
     })?;
-    set_parents(pool, kb_id, id, parents).await?;
+    set_parents(&mut tx, kb_id, id, parents).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -159,9 +353,24 @@ pub async fn update_entity_type(
     description: &str,
 ) -> AppResult<()> {
     validate_shape(shape)?;
+    let mut tx = pool.begin().await?;
+    // 父链是签名判据（0062）：违规按祖先链算。只比父集——label、颜色那些
+    // 不改判据的字段照常写，不必跑检测
+    let old_parents: Vec<Uuid> =
+        sqlx::query_scalar("SELECT parent_id FROM entity_type_parents WHERE child_id = $1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let parents_changed =
+        parents.len() != old_parents.len() || !parents.iter().all(|p| old_parents.contains(p));
+    let was_detected = if parents_changed {
+        Some(crate::reasoning::detection_keys(&mut tx, kb_id).await?)
+    } else {
+        None
+    };
     let res = sqlx::query(
         "UPDATE entity_types SET label = $3, color = COALESCE($4, color), shape = $5,
-                description = $6
+                description = $6, updated_at = now()
          WHERE id = $2 AND kb_id = $1",
     )
     .bind(kb_id)
@@ -170,12 +379,16 @@ pub async fn update_entity_type(
     .bind(color)
     .bind(shape)
     .bind(description)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    set_parents(pool, kb_id, id, parents).await?;
+    set_parents(&mut tx, kb_id, id, parents).await?;
+    if let Some(was) = was_detected {
+        crate::reasoning::reconcile_ontology(&mut tx, kb_id, &was).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -184,8 +397,8 @@ pub async fn update_entity_type(
 /// **先查环再写**。单父时代只需要挡自环，一条链天然不会成环；DAG 里 A→B→A
 /// 完全可能，而 `type_matches_domain` 沿父链上溯，成环就是死循环。
 /// SQL 拦不住这个——外键只挡自环，更长的要应用来查。
-pub async fn set_parents(
-    pool: &PgPool,
+async fn set_parents(
+    conn: &mut PgConnection,
     kb_id: Uuid,
     child: Uuid,
     parents: &[Uuid],
@@ -208,7 +421,7 @@ pub async fn set_parents(
         )
         .bind(child)
         .bind(parents)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
         if cycles > 0 {
             return Err(AppError::invalid(
@@ -219,7 +432,7 @@ pub async fn set_parents(
     }
     sqlx::query("DELETE FROM entity_type_parents WHERE child_id = $1")
         .bind(child)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     for (i, p) in parents.iter().enumerate() {
         sqlx::query(
@@ -230,7 +443,7 @@ pub async fn set_parents(
         .bind(p)
         // 第一个当主父：界面上说明了"画在第一个下面"，不再多一个控件
         .bind(i == 0)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     let _ = kb_id;
@@ -238,18 +451,38 @@ pub async fn set_parents(
 }
 
 pub async fn delete_entity_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
     let (usage,): (i64,) = sqlx::query_as("SELECT count(*) FROM entities WHERE type_id = $1")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
     if usage > 0 {
         return Err(AppError::Conflict(format!(
             "Cannot delete: {usage} entities use this type"
         )));
     }
+    // 这个类若牵着签名判据——是某个类的父类，或挂在某条关系的
+    // domain / range 上——删掉它就改了「哪些违规成立」（0062）。
+    // 动笔前把旧判据下的检出键集记下来，提交前对账
+    let affects_criteria: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM entity_type_parents WHERE parent_id = $1)
+            OR EXISTS(SELECT 1 FROM relation_type_domains WHERE entity_type_id = $1)
+            OR EXISTS(SELECT 1 FROM relation_type_ranges WHERE entity_type_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let was_detected = if affects_criteria {
+        Some(crate::reasoning::detection_keys(&mut tx, kb_id).await?)
+    } else {
+        None
+    };
     // 只剩这一个 domain 的属性随类一起走：属性必须挂在类上，
     // 留一个没有 domain 的属性等于留一个不会出现在任何地方的死行。
-    // 还挂在别的类上的则只掉一条关联（外键 CASCADE 负责）
+    // 还挂在别的类上的则只掉一条关联（外键 CASCADE 负责）。
+    // 连带效果（0070 的 FK CASCADE）：属性没了 → 用它做谓词的事实没了 →
+    // 指向那些事实的违规行也被物理删掉。这些行不走 `criterion_changed`——
+    // 它们的判据没换，是事实本身没了，与 `run` 对消失事实的清陈同一条规矩
     sqlx::query(
         "DELETE FROM relation_types r
          WHERE r.kind = 'attribute' AND r.kb_id = $1
@@ -260,18 +493,22 @@ pub async fn delete_entity_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResu
     )
     .bind(kb_id)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let res = sqlx::query("DELETE FROM entity_types WHERE id = $2 AND kb_id = $1 AND NOT builtin")
         .bind(kb_id)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::Conflict(
             "Built-in types cannot be deleted".into(),
         ));
     }
+    if let Some(was) = was_detected {
+        crate::reasoning::reconcile_ontology(&mut tx, kb_id, &was).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -315,7 +552,7 @@ fn validate_attribute_fields(
 /// 子属性不能是自己（DB 有 CHECK，但撞上去是 500，得在这里给出人话）。
 /// 而**逆是自己允许**——那等于对称，R0 会提示改用 `symmetric` 更直白，不算错。
 async fn validate_property_links(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     kb_id: Uuid,
     self_id: Option<Uuid>,
     kind: &str,
@@ -342,7 +579,7 @@ async fn validate_property_links(
             sqlx::query_as("SELECT kind FROM relation_types WHERE id = $1 AND kb_id = $2")
                 .bind(target)
                 .bind(kb_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?;
         match ok {
             // 不区分「不存在」与「在别的库」：能问出哪个 UUID 存在于别处，
@@ -366,8 +603,8 @@ async fn validate_property_links(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn create_relation_type(
-    pool: &PgPool,
+pub async fn create_relation_type<'a>(
+    pool: impl sqlx::Acquire<'a, Database = sqlx::Postgres>,
     kb_id: Uuid,
     key: &str,
     label: &str,
@@ -381,14 +618,12 @@ pub async fn create_relation_type(
     unit: Option<&str>,
 ) -> AppResult<Uuid> {
     validate_key(key)?;
-    if !matches!(temporal, "state" | "event" | "eternal") {
-        return Err(AppError::Validation(
-            "temporal must be state / event / eternal".into(),
-        ));
-    }
+    validate_temporal(temporal)?;
     validate_attribute_fields(kind, domains, datatype)?;
+    let mut tx = pool.begin().await?;
+    let label = &lower_camel(label);
     // 新建的行 id 还不存在，指向自己无从谈起——所以 self_id 传 None
-    validate_property_links(pool, kb_id, None, kind, ax).await?;
+    validate_property_links(&mut tx, kb_id, None, kind, ax).await?;
     let is_attr = kind == "attribute";
     let id = Uuid::now_v7();
     sqlx::query(
@@ -419,7 +654,7 @@ pub async fn create_relation_type(
     // 属性不带这两条（上面已经拦了非空的情况，这里是兜底）
     .bind(if is_attr { None } else { ax.inverse_of })
     .bind(if is_attr { None } else { ax.sub_property_of })
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| match &e {
         sqlx::Error::Database(db) if db.is_unique_violation() => {
@@ -428,14 +663,15 @@ pub async fn create_relation_type(
         _ => AppError::Db(e),
     })?;
     // attribute 不写 range：它的值域是字面量类型，落在 datatype 上
-    set_domains_ranges(pool, id, domains, if is_attr { &[] } else { ranges }).await?;
+    set_domains_ranges(&mut tx, id, domains, if is_attr { &[] } else { ranges }).await?;
+    tx.commit().await?;
     Ok(id)
 }
 
 /// 覆盖式写入 domain / range。**先删后插**，所以它既能用于新建也能用于重导入，
 /// 且不会留下上一轮的残余。
 async fn set_domains_ranges(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     relation_type_id: Uuid,
     domains: &[Uuid],
     ranges: &[Uuid],
@@ -446,7 +682,7 @@ async fn set_domains_ranges(
     ] {
         sqlx::query(&format!("DELETE FROM {table} WHERE relation_type_id = $1"))
             .bind(relation_type_id)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         if ids.is_empty() {
             continue;
@@ -459,9 +695,102 @@ async fn set_domains_ranges(
         ))
         .bind(relation_type_id)
         .bind(ids)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// 一条关系声明自己的边能带哪些属性（0037）。覆盖式写入，与 domain / range 同一套。
+///
+/// 两条校验都在这里，CHECK 引不到别的行：同库，且每一个都是 `kind = 'attribute'`
+/// ——边上的属性是字面值，复用的正是属性定义的 datatype / unit / 换算。
+/// 一个关系不能把自己声明成自己的属性（DB 有 CHECK，这里给人话）。
+pub async fn set_relation_qualifiers(
+    pool: &PgPool,
+    kb_id: Uuid,
+    relation_type_id: Uuid,
+    qualifier_type_ids: &[Uuid],
+) -> AppResult<()> {
+    if qualifier_type_ids.contains(&relation_type_id) {
+        return Err(AppError::invalid(
+            "qualifier_is_self",
+            "A relation cannot be its own qualifier",
+        ));
+    }
+    if !qualifier_type_ids.is_empty() {
+        let (ok,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM relation_types
+             WHERE kb_id = $1 AND kind = 'attribute' AND id = ANY($2)",
+        )
+        .bind(kb_id)
+        .bind(qualifier_type_ids)
+        .fetch_one(pool)
+        .await?;
+        if ok as usize != qualifier_type_ids.len() {
+            return Err(AppError::invalid(
+                "qualifier_not_attribute",
+                "Every qualifier must be an attribute of this base",
+            ));
+        }
+    }
+    sqlx::query("DELETE FROM relation_type_qualifiers WHERE relation_type_id = $1")
+        .bind(relation_type_id)
+        .execute(pool)
+        .await?;
+    if !qualifier_type_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO relation_type_qualifiers (relation_type_id, qualifier_type_id)
+             SELECT $1, x FROM unnest($2::uuid[]) AS x
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(relation_type_id)
+        .bind(qualifier_type_ids)
         .execute(pool)
         .await?;
     }
+    Ok(())
+}
+
+/// 给一条关系**追加**一个边上的属性声明（0037）。
+///
+/// 与 `set_relation_qualifiers` 的覆盖式不同：抽取时几篇文档并行，各自从语料里
+/// 补声明，覆盖式写入会把别人刚补的冲掉（实测 `round` 补过又没了）。
+/// 这里只加不删，撞上已有的什么都不做。校验与覆盖式同一套。
+pub async fn add_relation_qualifier(
+    pool: &PgPool,
+    kb_id: Uuid,
+    relation_type_id: Uuid,
+    qualifier_type_id: Uuid,
+) -> AppResult<()> {
+    if relation_type_id == qualifier_type_id {
+        return Err(AppError::invalid(
+            "qualifier_is_self",
+            "A relation cannot be its own qualifier",
+        ));
+    }
+    let (ok,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM relation_types
+         WHERE kb_id = $1 AND kind = 'attribute' AND id = $2",
+    )
+    .bind(kb_id)
+    .bind(qualifier_type_id)
+    .fetch_one(pool)
+    .await?;
+    if ok != 1 {
+        return Err(AppError::invalid(
+            "qualifier_not_attribute",
+            "Every qualifier must be an attribute of this base",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO relation_type_qualifiers (relation_type_id, qualifier_type_id)
+         VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(relation_type_id)
+    .bind(qualifier_type_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -476,37 +805,114 @@ pub async fn update_relation_type(
     description: &str,
     datatype: Option<&str>,
     unit: Option<&str>,
-    // None = 不动。不管 domain 的调用方（属性表单）传 None，
-    // 否则一次不相干的改名就会把属性的 domain 清空
+    // 整组语义：两侧都 None = 签名不动；任一侧 Some = 两侧都按传入值重写
+    // （没传的那一侧清空）。不管签名的调用方（如纯改公理位）必须两侧都传
+    // None——`domains=Some(..)` + `ranges=None` 会把 range 清空
     domains: Option<&[Uuid]>,
     ranges: Option<&[Uuid]>,
 ) -> AppResult<()> {
-    if !matches!(temporal, "state" | "event" | "eternal") {
-        return Err(AppError::Validation(
-            "temporal must be state / event / eternal".into(),
+    // 整条改动进一条事务：判据变了的话，落笔前要先记下旧本体下检出的违规，
+    // 落笔后按新本体重检、收编旧判据的行——`open` 的意思是「已对账于当前本体」
+    //（0062），不许留一行只对旧判据成立的 open 违规走出提交点
+    let mut tx = pool.begin().await?;
+    // 名字属性是内建的（0041）：标成 functional 会让每个第二个名字都成一条冲突、
+    // 甚至把本名关掉；改名、改时态也一样没有正当用途
+    let name_attribute: Option<(bool,)> = sqlx::query_as(
+        "SELECT builtin AND key = 'known_as' FROM relation_types WHERE id = $1 AND kb_id = $2",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if name_attribute == Some((true,)) {
+        return Err(AppError::invalid(
+            "builtin_name_attribute",
+            "The name attribute is built in and cannot be edited",
         ));
     }
+    // 改名也归一：不然界面上改一次就能把小驼峰改回 "access to"
+    let label = &lower_camel(label);
+    validate_temporal(temporal)?;
     if datatype.is_some() && !matches!(datatype, Some("text" | "number" | "date" | "bool")) {
         return Err(AppError::Validation(
             "datatype must be text / number / date / bool".into(),
         ));
     }
+    // 旧判据先取下来：公理位、时态、两条关系链、domain/range 一起决定
+    // 「哪些违规成立」。行不在就是 NotFound——UPDATE 反正会空
+    let old: Option<OldCriteria> = sqlx::query_as(
+        "SELECT kind, temporal, functional, inverse_functional, is_transitive,
+                is_symmetric, is_asymmetric, is_irreflexive, inverse_of, sub_property_of
+           FROM relation_types WHERE id = $1 AND kb_id = $2",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(old) = old else {
+        return Err(AppError::NotFound);
+    };
     // 指向别的关系的两条要先问过库：目标在不在本库、是不是关系。
     // 只在真的填了的时候查——清空（两个都 None）没有目标可验
     if ax.inverse_of.is_some() || ax.sub_property_of.is_some() {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT kind FROM relation_types WHERE id = $1 AND kb_id = $2")
-                .bind(id)
-                .bind(kb_id)
-                .fetch_optional(pool)
-                .await?;
-        let (kind,) = row.ok_or(AppError::NotFound)?;
-        validate_property_links(pool, kb_id, Some(id), &kind, ax).await?;
+        validate_property_links(&mut tx, kb_id, Some(id), &old.kind, ax).await?;
     }
-    // kind 不可变（改它会让存量事实语义错乱）。domain/range 可改——
-    // 它们是签名不是身份，"这个属性也适用于承包商" 是个正当的编辑。
-    // datatype/unit 只对 attribute 行生效，datatype 缺省保持原值
-    //
+    // domain/range 可改——它们是签名不是身份，"这个属性也适用于承包商" 是个正当的
+    // 编辑。kind 不可变（改它会让存量事实语义错乱）
+    let signature_touched = domains.is_some() || ranges.is_some();
+    let mut signature_changed = false;
+    let next_domains: &[Uuid] = domains.unwrap_or(&[]);
+    let next_ranges: &[Uuid] = if old.kind == "attribute" {
+        // 属性没有 range：它的值域是字面量类型，落在 datatype 上
+        &[]
+    } else {
+        ranges.unwrap_or(&[])
+    };
+    if signature_touched {
+        if old.kind == "attribute" && next_domains.is_empty() {
+            return Err(AppError::invalid(
+                "attr_needs_class",
+                "An attribute needs a class (domain)",
+            ));
+        }
+        let old_domains: HashSet<Uuid> = sqlx::query_scalar(
+            "SELECT entity_type_id FROM relation_type_domains WHERE relation_type_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        let old_ranges: HashSet<Uuid> = sqlx::query_scalar(
+            "SELECT entity_type_id FROM relation_type_ranges WHERE relation_type_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        signature_changed = old_domains != next_domains.iter().copied().collect::<HashSet<_>>()
+            || old_ranges != next_ranges.iter().copied().collect::<HashSet<_>>();
+    }
+    // label / description / datatype / unit 不进这里：它们不动判据，
+    // 改了不值得跑一遍检测
+    let criteria_changed = old.temporal != temporal
+        || old.functional != ax.functional
+        || old.inverse_functional != ax.inverse_functional
+        || old.is_transitive != ax.transitive
+        || old.is_symmetric != ax.symmetric
+        || old.is_asymmetric != ax.asymmetric
+        || old.is_irreflexive != ax.irreflexive
+        || old.inverse_of != ax.inverse_of
+        || old.sub_property_of != ax.sub_property_of
+        || signature_changed;
+    // 检出必须在写入**之前**：此刻库里还是旧本体，记下的正是「旧判据下
+    // 会算出来的违规」，提交前对照用
+    let was_detected = if criteria_changed {
+        Some(crate::reasoning::detection_keys(&mut tx, kb_id).await?)
+    } else {
+        None
+    };
     // 两条链**跟着六位公理一起覆盖式写**：缺省 = 清空，不是「不动」。
     // 与 `is_transitive` 那几位同一条规矩——它们是同一个表单里同时提交的
     // 一组声明，一半覆盖一半保留才是真正会出事的语义
@@ -518,7 +924,7 @@ pub async fn update_relation_type(
                 unit = CASE WHEN kind = 'attribute' THEN $9 ELSE unit END,
                 is_transitive = $10, is_symmetric = $11,
                 is_asymmetric = $12, is_irreflexive = $13,
-                inverse_of = $14, sub_property_of = $15
+                inverse_of = $14, sub_property_of = $15, updated_at = now()
          WHERE id = $2 AND kb_id = $1",
     )
     .bind(kb_id)
@@ -536,165 +942,80 @@ pub async fn update_relation_type(
     .bind(ax.irreflexive)
     .bind(ax.inverse_of)
     .bind(ax.sub_property_of)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    if domains.is_some() || ranges.is_some() {
-        let (kind,): (String,) = sqlx::query_as("SELECT kind FROM relation_types WHERE id = $1")
-            .bind(id)
-            .fetch_one(pool)
-            .await?;
-        let next_domains = domains.unwrap_or(&[]);
-        if kind == "attribute" && next_domains.is_empty() {
-            return Err(AppError::invalid(
-                "attr_needs_class",
-                "An attribute needs a class (domain)",
-            ));
-        }
-        // 属性没有 range：它的值域是字面量类型，落在 datatype 上
-        let next_ranges: &[Uuid] = if kind == "attribute" {
-            &[]
-        } else {
-            ranges.unwrap_or(&[])
-        };
-        set_domains_ranges(pool, id, next_domains, next_ranges).await?;
+    if signature_touched {
+        set_domains_ranges(&mut tx, id, next_domains, next_ranges).await?;
     }
+    if let Some(was) = was_detected {
+        crate::reasoning::reconcile_ontology(&mut tx, kb_id, &was).await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
+/// `relation_types` 一行里跟「哪些违规成立」有关的列（0062 对账用的旧判据快照）。
+/// label / description / datatype / unit 不在——它们不动判据
+#[derive(sqlx::FromRow)]
+struct OldCriteria {
+    kind: String,
+    temporal: String,
+    functional: bool,
+    inverse_functional: bool,
+    is_transitive: bool,
+    is_symmetric: bool,
+    is_asymmetric: bool,
+    is_irreflexive: bool,
+    inverse_of: Option<Uuid>,
+    sub_property_of: Option<Uuid>,
+}
+
 pub async fn delete_relation_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
     let (usage,): (i64,) = sqlx::query_as("SELECT count(*) FROM facts WHERE predicate_id = $1")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
     if usage > 0 {
         return Err(AppError::Conflict(format!(
             "Cannot delete: {usage} facts use this relation"
         )));
     }
+    // 判据贡献不只「有没有人引用它」这一半：这行自己的旗标与出向
+    // inverse_of/sub_property_of 链接喂着别的谓词的派生链，rules_disagree
+    // 缺陷行也以谓词 id 指着它。枚举哪些列算判据已被证明会漏——删除又足够
+    // 稀少，不为省检测设门槛，一律记下旧判据下的检出键集（0062）
+    let was_detected = crate::reasoning::detection_keys(&mut tx, kb_id).await?;
+    // 0070 把这两条外键建成 DEFERRABLE 的 SET NULL——级联动作提交时才落地，
+    // 而对账检测要看见改完的判据，所以先在事务里显式断链
+    sqlx::query("UPDATE relation_types SET inverse_of = NULL WHERE inverse_of = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE relation_types SET sub_property_of = NULL WHERE sub_property_of = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let res =
         sqlx::query("DELETE FROM relation_types WHERE id = $2 AND kb_id = $1 AND NOT builtin")
             .bind(kb_id)
             .bind(id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     if res.rows_affected() == 0 {
         return Err(AppError::Conflict(
             "Built-in relations cannot be deleted".into(),
         ));
     }
+    crate::reasoning::reconcile_ontology(&mut tx, kb_id, &was_detected).await?;
+    tx.commit().await?;
     Ok(())
 }
 
 /* ---- 未匹配统计 ---- */
-
-pub async fn record_miss(
-    pool: &PgPool,
-    kb_id: Uuid,
-    kind: &str,
-    key: &str,
-    example: Option<&str>,
-) -> AppResult<()> {
-    sqlx::query(
-        // **被拒绝过的照样累加。**
-        //
-        // 从前这里带着 `WHERE dismissed_at IS NULL`，理由是"否则计数会把'不要'
-        // 重新顶成一个待处理信号"。那个理由针对的是**呈现**，用的手段却是
-        // **停止计数**——两件事被绑在一起了，代价是一次点击变成永久失明：
-        // 第一篇里出现一次的说法被忽略掉，后面二十篇都在用它，计数仍停在 1，
-        // 谁也不知道当初那个判断已经不成立，那批事实永远留在兜底谓词上。
-        //
-        // 用户是对**当时看得见的证据**做的判断，不是对所有时间。所以计数照记，
-        // 抑制交给读取侧：`list_misses` 仍然只返回未忽略的，提案与自动扩本体
-        // 一步没变；已忽略的连同更新后的计数走 `list_dismissed_misses`，
-        // 在面板上单列一处，人看见涨到 40 了可以自己撤回
-        "INSERT INTO ontology_misses (kb_id, kind, key, example)
-         VALUES ($1, $2, left($3, 80), left($4, 200))
-         ON CONFLICT (kb_id, kind, key)
-         DO UPDATE SET count = ontology_misses.count + 1,
-                       example = COALESCE(EXCLUDED.example, ontology_misses.example),
-                       updated_at = now()",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .bind(example)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn list_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMiss>> {
-    Ok(sqlx::query_as(
-        "SELECT kind, key, example, count FROM ontology_misses
-         WHERE kb_id = $1 AND dismissed_at IS NULL
-         ORDER BY count DESC, updated_at DESC LIMIT 50",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 已被忽略的说法，连同**它此后继续累积的计数**。
-///
-/// 存在的理由是忽略这个动作曾经是单向门：点下去之后既不再呈现、也不再计数，
-/// 于是"当时只出现过一次"这个判断依据一旦过期，没有任何人看得见。
-/// 这个列表是那扇门上的窗——抑制照旧，但看得见抑制掉的是什么、现在有多重。
-pub async fn list_dismissed_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMiss>> {
-    Ok(sqlx::query_as(
-        "SELECT kind, key, example, count FROM ontology_misses
-         WHERE kb_id = $1 AND dismissed_at IS NOT NULL
-         ORDER BY count DESC, updated_at DESC LIMIT 50",
-    )
-    .bind(kb_id)
-    .fetch_all(pool)
-    .await?)
-}
-
-/// 撤回一次忽略：这个说法重新进入提案与自动扩本体。
-pub async fn restore_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_misses SET dismissed_at = NULL, updated_at = now()
-         WHERE kb_id = $1 AND kind = $2 AND key = $3 AND dismissed_at IS NOT NULL",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 用户说"不要这个"。**标记而非删除**——删掉的话下一次抽取遇到同一个词
-/// 原样插回来，用户的拒绝活不过一轮抽取。自动扩展路径也据此绕开。
-///
-/// 可撤回（见 [`restore_miss`]），且撤回之后计数是连续的——忽略期间照样在记。
-pub async fn dismiss_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE ontology_misses SET dismissed_at = now()
-         WHERE kb_id = $1 AND kind = $2 AND key = $3 AND dismissed_at IS NULL",
-    )
-    .bind(kb_id)
-    .bind(kind)
-    .bind(key)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// 本体已经覆盖了这个说法（采纳时调用）：与"用户拒绝"不同，这条真的可以清掉，
-/// 下次抽取它会命中本体，不再是未匹配。
-pub async fn clear_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
-    sqlx::query("DELETE FROM ontology_misses WHERE kb_id = $1 AND kind = $2 AND key = $3")
-        .bind(kb_id)
-        .bind(kind)
-        .bind(key)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
 
 /* ---- OWL 导入 ---- */
 
@@ -749,7 +1070,8 @@ pub async fn update_type_from_import(
          SET label = $3,
              -- 空描述不覆盖已有的：上游可能没写 rdfs:comment，而本地可能
              -- 已经被人按自己的语料调过，那份调整比空值有价值
-             description = CASE WHEN $4 = '' THEN description ELSE $4 END
+             description = CASE WHEN $4 = '' THEN description ELSE $4 END,
+             updated_at = now()
          WHERE kb_id = $1 AND iri = $2 RETURNING id",
     )
     .bind(kb_id)
@@ -759,53 +1081,6 @@ pub async fn update_type_from_import(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
-}
-
-/// 设父类。自环与已是该父类的情形静默跳过。
-/// 从导入建一个属性（`kind='attribute'`），带 IRI。
-///
-/// 与 [`create_relation_type`] 的区别只在多了 `iri` 与 key 冲突的处置：
-/// 导入按 IRI 认身份，key 撞了是"两个不同的东西争一个短标签"，
-/// 由调用方在计划阶段报告并跳过，到这里不该再撞——所以冲突时返回 None
-/// 而不是覆盖，让调用方把它计进"跳过"。
-///
-/// `temporal` 固定 `state`：属性是随时间变化的取值（薪资、人数），
-/// 新值闭合旧值正是我们要的。OWL 里没有对应概念，猜 event 或 eternal 都更差。
-#[allow(clippy::too_many_arguments)]
-pub async fn create_attribute_with_iri(
-    pool: &PgPool,
-    kb_id: Uuid,
-    key: &str,
-    label: &str,
-    description: &str,
-    iri: &str,
-    domains: &[Uuid],
-    datatype: &str,
-) -> AppResult<Option<Uuid>> {
-    validate_key(key)?;
-    let id = Uuid::now_v7();
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "INSERT INTO relation_types
-             (id, kb_id, key, label, temporal, functional, inverse_functional,
-              description, kind, datatype, iri)
-         VALUES ($1, $2, $3, $4, 'state', FALSE, FALSE, $5, 'attribute', $6, $7)
-         ON CONFLICT (kb_id, key) DO NOTHING
-         RETURNING id",
-    )
-    .bind(id)
-    .bind(kb_id)
-    .bind(key)
-    .bind(label)
-    .bind(description)
-    .bind(datatype)
-    .bind(iri)
-    .fetch_optional(pool)
-    .await?;
-    let Some((new_id,)) = row else {
-        return Ok(None);
-    };
-    set_domains_ranges(pool, new_id, domains, &[]).await?;
-    Ok(Some(new_id))
 }
 
 /// 从导入建一个关系（`kind='relation'`），带 IRI。
@@ -852,7 +1127,7 @@ pub async fn create_relation_with_iri(
     let Some((new_id,)) = row else {
         return Ok(None);
     };
-    set_domains_ranges(pool, new_id, domains, ranges).await?;
+    set_domains_ranges(&mut *pool.acquire().await?, new_id, domains, ranges).await?;
     Ok(Some(new_id))
 }
 
@@ -860,6 +1135,11 @@ pub async fn create_relation_with_iri(
 ///
 /// **key 不动**（它可能已被事实引用），**空描述不覆盖**（人写过的比上游的准），
 /// **domain/range 整体重写**——它们是上游声明的结构，不是人调过的措辞。
+/// **`temporal` 只在本体说了才写**（`Some`）：没写 `utopia:temporal` 的本体不动它，
+/// 人在页面上改过的就留着；写了的照本体，与 domain/range 同一个道理。
+/// 真改了就推 `updated_at`，与页面上改一样：0053 的短语绑定依据读它，
+/// state 与非 state 决定短语怎么绑，旧值下做的决定要能被重审。
+#[allow(clippy::too_many_arguments)]
 pub async fn update_relation_from_import(
     pool: &PgPool,
     kb_id: Uuid,
@@ -868,11 +1148,17 @@ pub async fn update_relation_from_import(
     description: &str,
     domains: &[Uuid],
     ranges: &[Uuid],
+    temporal: Option<&str>,
 ) -> AppResult<bool> {
+    if let Some(t) = temporal {
+        validate_temporal(t)?;
+    }
     let row: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE relation_types
             SET label = $3,
-                description = CASE WHEN $4 = '' THEN description ELSE $4 END
+                description = CASE WHEN $4 = '' THEN description ELSE $4 END,
+                temporal = COALESCE($5::text, temporal),
+                updated_at = CASE WHEN $5::text <> temporal THEN now() ELSE updated_at END
           WHERE kb_id = $1 AND iri = $2
           RETURNING id",
     )
@@ -880,12 +1166,13 @@ pub async fn update_relation_from_import(
     .bind(iri)
     .bind(label)
     .bind(description)
+    .bind(temporal)
     .fetch_optional(pool)
     .await?;
     let Some((id,)) = row else {
         return Ok(false);
     };
-    set_domains_ranges(pool, id, domains, ranges).await?;
+    set_domains_ranges(&mut *pool.acquire().await?, id, domains, ranges).await?;
     Ok(true)
 }
 
@@ -987,49 +1274,64 @@ pub async fn types_needing_embedding(
     model: &str,
     only: Option<TypeKind>,
 ) -> AppResult<Vec<TypeToEmbed>> {
-    let mut out = Vec::new();
     if only == Some(TypeKind::Relation) {
         // 类型消解只用类，等 1633 个关系嵌完是白等六分钟
         return relations_needing_embedding(pool, kb_id, model).await;
     }
-    let ents: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, label, coalesce(description, '') FROM entity_types
-         WHERE kb_id = $1
-           AND (embedding IS NULL
-                OR embedded_model IS DISTINCT FROM $2
-                OR embedded_text IS DISTINCT FROM
-                   CASE WHEN coalesce(btrim(description), '') = '' THEN btrim(label)
-                        ELSE btrim(label) || E'\n' || btrim(description) END)",
+    // **陈不陈，用生成原文的同一个函数判**（#672）。从前在 SQL 里用 `btrim` 把这段字
+    // 重拼一遍再比，而 `embed_text` 用的是 Rust 的 `trim`：`btrim` 只去空格，`trim`
+    // 连换行、制表符一起去。schema.org 的描述结尾是 "\n      "，这些行存下的原文与
+    // SQL 拼出来的永远不等，于是每轮都判成陈的——补齐任务把同一批行一遍遍重嵌，
+    // 抽取门控（#526）等一个永远补不齐的索引，直到期限把文档判失败。
+    // 与 `mappings::needing_embedding` 同一个教训：拉回来在 Rust 里比
+    let rows: Vec<StoredEmbedding> = sqlx::query_as(
+        "SELECT id, label, coalesce(description, '') AS description,
+                embedding IS NOT NULL AS embedded, embedded_model, embedded_text,
+                label_embedding IS NOT NULL AS label_embedded, label_embedded_model, label_embedded_text
+           FROM entity_types
+          WHERE kb_id = $1",
     )
     .bind(kb_id)
-    .bind(model)
     .fetch_all(pool)
     .await?;
-    out.extend(ents.into_iter().map(|(id, label, desc)| TypeToEmbed {
-        id,
-        kind: TypeKind::Entity,
-        text: embed_text(&label, &desc),
-        field: EmbedField::Full,
-    }));
-    // 只嵌 label 的那一份（见 `entity_types.label_embedding`）。短查询走这个索引——查询分了两种形状，
-    // 文档也得分两种，否则短查询被同义反复的类接管
-    let labels: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, label FROM entity_types
-         WHERE kb_id = $1
-           AND (label_embedding IS NULL
-                OR label_embedded_model IS DISTINCT FROM $2
-                OR label_embedded_text IS DISTINCT FROM btrim(label))",
-    )
-    .bind(kb_id)
-    .bind(model)
-    .fetch_all(pool)
-    .await?;
-    out.extend(labels.into_iter().map(|(id, label)| TypeToEmbed {
-        id,
-        kind: TypeKind::Entity,
-        text: label.trim().to_string(),
-        field: EmbedField::Label,
-    }));
+    let mut full = Vec::new();
+    let mut labels = Vec::new();
+    for r in rows {
+        let text = embed_text(&r.label, &r.description);
+        if is_stale(
+            r.embedded,
+            r.embedded_model.as_deref(),
+            r.embedded_text.as_deref(),
+            model,
+            &text,
+        ) {
+            full.push(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Entity,
+                text,
+                field: EmbedField::Full,
+            });
+        }
+        // 只嵌 label 的那一份（见 `entity_types.label_embedding`）。短查询走这个索引——查询分了两种形状，
+        // 文档也得分两种，否则短查询被同义反复的类接管
+        let short = r.label.trim().to_string();
+        if is_stale(
+            r.label_embedded,
+            r.label_embedded_model.as_deref(),
+            r.label_embedded_text.as_deref(),
+            model,
+            &short,
+        ) {
+            labels.push(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Entity,
+                text: short,
+                field: EmbedField::Label,
+            });
+        }
+    }
+    let mut out = full;
+    out.extend(labels);
     if only == Some(TypeKind::Entity) {
         return Ok(out);
     }
@@ -1042,28 +1344,67 @@ async fn relations_needing_embedding(
     kb_id: Uuid,
     model: &str,
 ) -> AppResult<Vec<TypeToEmbed>> {
-    let mut out = Vec::new();
-    let rels: Vec<(Uuid, String, String)> = sqlx::query_as(
-        "SELECT id, label, coalesce(description, '') FROM relation_types
-         WHERE kb_id = $1
-           AND (embedding IS NULL
-                OR embedded_model IS DISTINCT FROM $2
-                OR embedded_text IS DISTINCT FROM
-                   CASE WHEN coalesce(btrim(description), '') = '' THEN btrim(label)
-                        ELSE btrim(label) || E'\n' || btrim(description) END)",
+    // 判据同上（#672）：在 Rust 里用 `embed_text` 比，不在 SQL 里重拼。关系只有整段
+    // 那一份向量，label 那三列补空。
+    //
+    // 名字属性不嵌（0041）：没有向量就不会被最近邻检索出来，本体提议、属性归并、
+    // 抽取时的候选清单都碰不到它——名字只走抽取回复里的 `names` 那一条路
+    let rows: Vec<StoredEmbedding> = sqlx::query_as(
+        "SELECT id, label, coalesce(description, '') AS description,
+                embedding IS NOT NULL AS embedded, embedded_model, embedded_text,
+                false AS label_embedded, NULL::text AS label_embedded_model,
+                NULL::text AS label_embedded_text
+           FROM relation_types
+          WHERE kb_id = $1 AND NOT (builtin AND key = 'known_as')",
     )
     .bind(kb_id)
-    .bind(model)
     .fetch_all(pool)
     .await?;
-    out.extend(rels.into_iter().map(|(id, label, desc)| TypeToEmbed {
-        id,
-        kind: TypeKind::Relation,
-        text: embed_text(&label, &desc),
-        // 关系没有短查询那一路,只有整段这一份
-        field: EmbedField::Full,
-    }));
-    Ok(out)
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let text = embed_text(&r.label, &r.description);
+            is_stale(
+                r.embedded,
+                r.embedded_model.as_deref(),
+                r.embedded_text.as_deref(),
+                model,
+                &text,
+            )
+            .then_some(TypeToEmbed {
+                id: r.id,
+                kind: TypeKind::Relation,
+                text,
+                // 关系没有短查询那一路,只有整段这一份
+                field: EmbedField::Full,
+            })
+        })
+        .collect())
+}
+
+/// 类型那一行上两份向量的现状，判陈用
+#[derive(sqlx::FromRow)]
+struct StoredEmbedding {
+    id: Uuid,
+    label: String,
+    description: String,
+    embedded: bool,
+    embedded_model: Option<String>,
+    embedded_text: Option<String>,
+    label_embedded: bool,
+    label_embedded_model: Option<String>,
+    label_embedded_text: Option<String>,
+}
+
+/// 没嵌过、换了模型、或者当时嵌的原文与现在要嵌的不一样
+fn is_stale(
+    embedded: bool,
+    stored_model: Option<&str>,
+    stored_text: Option<&str>,
+    model: &str,
+    text: &str,
+) -> bool {
+    !embedded || stored_model != Some(model) || stored_text != Some(text)
 }
 
 /// 回写向量，连同"嵌的是哪段字、用的哪个模型"。三者必须同一次写入——
@@ -1200,37 +1541,6 @@ pub async fn nearest_relation_types(
         .collect())
 }
 
-/// 按 key 找关系/属性的 id。给"映射到已有类型"那条路用。
-///
-/// 不区分 kind：属性与关系同住一张表且共用 key 命名空间，调用方拿到 id 之后
-/// 该怎么用它自己清楚（改写事实时谓词就是谓词）。
-pub async fn relation_type_id_by_key(
-    pool: &PgPool,
-    kb_id: Uuid,
-    key: &str,
-) -> AppResult<Option<Uuid>> {
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM relation_types WHERE kb_id = $1 AND key = $2")
-            .bind(kb_id)
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(id,)| id))
-}
-
-/// 一个属性声明的 datatype。改写字面值事实时要按它换算。
-///
-/// 以**库里这一条**为准而不是以请求为准：指向已有属性时请求里根本没有
-/// datatype，而即便有，本体说了算。
-pub async fn relation_type_datatype(pool: &PgPool, id: Uuid) -> AppResult<Option<String>> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT datatype FROM relation_types WHERE id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(d,)| d))
-}
-
 /// 把一个 IRI 认到已有的**本地**类上（原本没有 IRI 的那种）。
 ///
 /// **只写 IRI 与形状，不动 label、description、颜色。** 认领要解决的是
@@ -1255,7 +1565,7 @@ pub async fn adopt_iri_onto_key(
     iri: &str,
 ) -> AppResult<Option<Uuid>> {
     let row: Option<(Uuid,)> = sqlx::query_as(
-        "UPDATE entity_types SET iri = $3, shape = 'square'
+        "UPDATE entity_types SET iri = $3, shape = 'square', updated_at = now()
          WHERE kb_id = $1 AND key = $2 AND iri IS NULL
          RETURNING id",
     )
@@ -1267,31 +1577,6 @@ pub async fn adopt_iri_onto_key(
     Ok(row.map(|(id,)| id))
 }
 
-/// 与给定向量最近的若干**类 id**（只回 id，调用方手里已有类的全量数据）。
-///
-/// 给抽取用：分块向量在抽取循环里本来就有（实体消解在用），拿它检索出这一块
-/// 可能用得上的类，只把这些铺进提示词。
-pub async fn nearest_entity_type_ids(
-    pool: &PgPool,
-    kb_id: Uuid,
-    embedding: &[f32],
-    limit: i64,
-) -> AppResult<Vec<Uuid>> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM entity_types
-         WHERE kb_id = $1 AND embedding IS NOT NULL
-         ORDER BY embedding <=> $2
-         LIMIT $3",
-    )
-    .bind(kb_id)
-    .bind(Vector::from(embedding.to_vec()))
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-/// 同上，关系与属性。`only_kind` 分道：关系清单与属性清单在提示词里是两段。
 pub async fn nearest_relation_type_ids(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1313,6 +1598,28 @@ pub async fn nearest_relation_type_ids(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 这个库里有没有带向量的关系/属性（`only_kind` 同上）。谓词与
+/// [`nearest_relation_type_ids`] 的一字不差：这里答「没有」，那边对任何向量都返回空。
+///
+/// 存在的理由：短语对齐的短名单先把每条签名嵌入、再逐条问最近的属性，问回来是空才知道
+/// 属性还没向量。一个从没跑过 `embed_ontology` 的库每轮都把一万七千条签名送去嵌入，
+/// 一条也用不上（#1097）。先问这一句，用不上就不嵌
+pub async fn has_relation_type_vectors(
+    pool: &PgPool,
+    kb_id: Uuid,
+    only_kind: Option<&str>,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM relation_types
+                        WHERE kb_id = $1 AND embedding IS NOT NULL
+                          AND ($2::text IS NULL OR kind = $2))",
+    )
+    .bind(kb_id)
+    .bind(only_kind)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// 一次插完一批类，返回 key → id。
@@ -1390,13 +1697,16 @@ pub struct BulkRelation {
     pub symmetric: bool,
     pub asymmetric: bool,
     pub irreflexive: bool,
+    /// `state` / `event` / `eternal`（0031）。OWL 自己没有这个概念，标准词表里的对象
+    /// 属性全是 `state`；只有本体用 `utopia:temporal` 说了的才不是——导出端写的那一条
+    pub temporal: String,
 }
 
 /// 一次插完一批关系或属性，返回 key → id。语义同 [`create_entity_types_bulk`]。
 ///
 /// `kind` 决定走关系通道还是属性通道；`datatype` 只对属性有意义，关系传 `None`。
-/// `temporal` 固定 `state`——OWL 里没有对应概念，猜 event 或 eternal 都更差
-/// （与单条版的判断一致）。
+/// `temporal` 照每一行写：没有 `utopia:temporal` 注解的本体一律 `state`
+///（与单条版的默认一致），写了的按它说的。
 pub async fn create_relation_types_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1407,9 +1717,13 @@ pub async fn create_relation_types_bulk(
     }
     for r in rows {
         validate_key(&r.key)?;
+        validate_temporal(&r.temporal)?;
     }
     let keys: Vec<&str> = rows.iter().map(|r| r.key.as_str()).collect();
-    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    // 导入来的词表自己就可能不一致（unece.org 里 `brandName` 与
+    // `ApplicableCertificate` 并存）——落库前统一，真身留在 `iri` 里
+    let camel: Vec<String> = rows.iter().map(|r| lower_camel(&r.label)).collect();
+    let labels: Vec<&str> = camel.iter().map(String::as_str).collect();
     let descs: Vec<&str> = rows.iter().map(|r| r.description.as_str()).collect();
     let iris: Vec<&str> = rows.iter().map(|r| r.iri.as_str()).collect();
     let kinds: Vec<&str> = rows.iter().map(|r| r.kind).collect();
@@ -1420,16 +1734,18 @@ pub async fn create_relation_types_bulk(
     let syms: Vec<bool> = rows.iter().map(|r| r.symmetric).collect();
     let asyms: Vec<bool> = rows.iter().map(|r| r.asymmetric).collect();
     let irrefs: Vec<bool> = rows.iter().map(|r| r.irreflexive).collect();
+    let temporals: Vec<&str> = rows.iter().map(|r| r.temporal.as_str()).collect();
     let out: Vec<(Uuid, String)> = sqlx::query_as(
         "INSERT INTO relation_types
              (id, kb_id, key, label, temporal, functional, inverse_functional,
               description, kind, datatype, iri,
               is_transitive, is_symmetric, is_asymmetric, is_irreflexive)
-         SELECT gen_random_uuid(), $1, k, l, 'state', fu, iv, d, kind, dt, i,
+         SELECT gen_random_uuid(), $1, k, l, tm, fu, iv, d, kind, dt, i,
                 tr, sy, asym, irr
          FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
-                     $8::bool[], $9::bool[], $10::bool[], $11::bool[], $12::bool[], $13::bool[])
-              AS t(k, l, d, i, kind, dt, fu, iv, tr, sy, asym, irr)
+                     $8::bool[], $9::bool[], $10::bool[], $11::bool[], $12::bool[], $13::bool[],
+                     $14::text[])
+              AS t(k, l, d, i, kind, dt, fu, iv, tr, sy, asym, irr, tm)
          ON CONFLICT (kb_id, key) DO NOTHING
          RETURNING id, key",
     )
@@ -1446,6 +1762,7 @@ pub async fn create_relation_types_bulk(
     .bind(&syms)
     .bind(&asyms)
     .bind(&irrefs)
+    .bind(&temporals)
     .fetch_all(pool)
     .await?;
     Ok(out.into_iter().map(|(id, k)| (k, id)).collect())
@@ -1589,130 +1906,127 @@ pub async fn set_disjoint_for(
 // 本体提案（见 `ontology_proposals`）
 // ---------------------------------------------------------------------------
 
-/// 一条落库的提案。`payload` 是接口原样返回的那一条。
+/// 一条落库的提案。`payload` 是接口原样返回的那一条。代理提的（0061）多带三样：
+/// 它服务的问题、它会绑上的形状，和谁提的
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StoredProposal {
     pub section: String,
     pub key: String,
     pub payload: serde_json::Value,
+    /// suggest | agent
+    pub proposed_by: String,
+    pub serves: Vec<Uuid>,
+    pub signatures: serde_json::Value,
 }
 
-/// 把一轮 Suggest 的结果写下来。
-///
-/// **已经有人表过态的不动。** `WHERE status = 'open'` 那一句是这个函数的全部要点：
-/// 重跑 Suggest 会再次算出被拒绝过的那条提案（原材料还在 `ontology_misses` 里），
-/// 不加这句它就会被刷回 open——等于每跑一次都把人的否决抹掉一次。
-pub async fn save_proposals(
+/// 代理的一条提案（0061 决定 2）：形状同 `save_proposals` 的一项，外加它服务的问题与会绑的形状
+pub struct AgentProposal {
+    pub section: String,
+    pub key: String,
+    pub payload: serde_json::Value,
+    pub serves: Vec<Uuid>,
+    pub signatures: serde_json::Value,
+}
+
+/// 把代理的一轮提案写下来。已经有人表过态的不动（同 `save_proposals`）；同一个键再提是刷新，
+/// 服务的问题与形状一起刷
+pub async fn save_agent_proposals(
     pool: &PgPool,
     kb_id: Uuid,
-    items: &[(String, String, serde_json::Value)],
+    items: &[AgentProposal],
 ) -> AppResult<()> {
-    for (section, key, payload) in items {
+    for it in items {
         sqlx::query(
-            "INSERT INTO ontology_proposals (id, kb_id, section, key, payload)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO ontology_proposals
+                 (id, kb_id, section, key, payload, proposed_by, serves, signatures)
+             VALUES ($1, $2, $3, $4, $5, 'agent', $6, $7)
              ON CONFLICT (kb_id, section, key) DO UPDATE
-               SET payload = EXCLUDED.payload, created_at = now()
+               SET payload = EXCLUDED.payload, proposed_by = 'agent',
+                   serves = EXCLUDED.serves, signatures = EXCLUDED.signatures,
+                   created_at = now()
                WHERE ontology_proposals.status = 'open'",
         )
         .bind(Uuid::now_v7())
         .bind(kb_id)
-        .bind(section)
-        .bind(key)
-        .bind(payload)
+        .bind(&it.section)
+        .bind(&it.key)
+        .bind(&it.payload)
+        .bind(&it.serves)
+        .bind(&it.signatures)
         .execute(pool)
         .await?;
     }
     Ok(())
 }
 
-/// 还等着人看的提案。新的排前面——旧的那批已经被看过好几眼了。
-pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredProposal>> {
-    Ok(sqlx::query_as(
-        "SELECT section, key, payload FROM ontology_proposals
-         WHERE kb_id = $1 AND status = 'open'
-         ORDER BY created_at DESC, key",
+/// 代理已经提过的形状（不论人怎么表的态）：下一轮不再为它们提——被拒的尤其不再提
+pub async fn signatures_already_proposed(
+    pool: &PgPool,
+    kb_id: Uuid,
+) -> AppResult<Vec<serde_json::Value>> {
+    Ok(sqlx::query_scalar(
+        "SELECT signatures FROM ontology_proposals WHERE kb_id = $1 AND proposed_by = 'agent'",
     )
     .bind(kb_id)
     .fetch_all(pool)
     .await?)
 }
 
-/// 一条提案被采纳或拒绝了。
+/// 一条提案被拒了，连理由（没写就空着）。
 ///
-/// **改状态而不是删行**：采纳发生过、拒绝也发生过。跟 `fact_adoptions`、
-/// `entity_retypes` 同一条路。拒绝留痕还有个当下就用得着的作用——下一轮
-/// Suggest 不会把它刷回待看。
-pub async fn decide_proposal(
+/// **改状态而不是删行**：拒绝发生过，跟 `fact_adoptions`、`entity_retypes` 同一条路。
+/// 留痕还有个当下就用得着的作用——代理下一轮不会把它刷回待看。
+pub async fn reject_proposal(
     pool: &PgPool,
     kb_id: Uuid,
     section: &str,
     key: &str,
-    status: &str,
+    reason: Option<&str>,
     actor: Uuid,
 ) -> AppResult<()> {
     sqlx::query(
         "UPDATE ontology_proposals
-            SET status = $4, decided_by = $5, decided_at = now()
+            SET status = 'rejected', reason = $4, decided_by = $5, decided_at = now()
           WHERE kb_id = $1 AND section = $2 AND key = $3 AND status = 'open'",
     )
     .bind(kb_id)
     .bind(section)
     .bind(key)
-    .bind(status)
+    .bind(reason.map(str::trim).filter(|r| !r.is_empty()))
     .bind(actor)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// 还有多少条等着看。0003 的缺口：关掉自动扩展开关之后没有「自上次以来有 N 条」
-/// 的提醒，信号在面板里但没人主动看——有了这张表，提醒就是这一句。
-pub async fn open_proposal_count(pool: &PgPool, kb_id: Uuid) -> AppResult<i64> {
-    let (n,): (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM ontology_proposals WHERE kb_id = $1 AND status = 'open'",
+/// 一条还开着的提案，按键取（代理把这一轮的 map_to 并进上一轮的时候读它）
+pub async fn open_proposal(
+    pool: &PgPool,
+    kb_id: Uuid,
+    section: &str,
+    key: &str,
+) -> AppResult<Option<StoredProposal>> {
+    Ok(sqlx::query_as(
+        "SELECT section, key, payload, proposed_by, serves, signatures FROM ontology_proposals
+         WHERE kb_id = $1 AND section = $2 AND key = $3 AND status = 'open'",
     )
     .bind(kb_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(n)
+    .bind(section)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?)
 }
 
-/// 主语的类型合不合这个关系声明的 domain。沿继承链往上找。
-///
-/// **只回答，不动数据。** 0001 已经判过：签名是提示不是闸门，
-/// 「用可能错的声明驱动自动动作风险高」。而实体类型本身也是模型判出来的
-/// （实测里 Elon Musk 被判成 `researcher`），拿它去翻转事实方向，
-/// 是两层不确定叠在一起还静默改写。所以这里的结果只用来落一条信号。
-///
-/// 三种回答，别混成两种：
-/// - `Some(true)`  合
-/// - `Some(false)` 不合——**这才是信号**
-/// - `None`        没得判（关系没声明 domain，或实体还没有类型）
-pub async fn subject_fits_domain(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    subject_type_id: Option<Uuid>,
-) -> AppResult<Option<bool>> {
-    let Some(subject_type_id) = subject_type_id else {
-        return Ok(None);
-    };
-    let (declared, ok): (i64, i64) = sqlx::query_as(
-        "WITH RECURSIVE up(id) AS (
-             SELECT $2::uuid
-             UNION
-             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
-         )
-         SELECT (SELECT count(*) FROM relation_type_domains WHERE relation_type_id = $1),
-                (SELECT count(*) FROM relation_type_domains d
-                   JOIN up ON up.id = d.entity_type_id
-                  WHERE d.relation_type_id = $1)",
+/// 还等着人看的提案。新的排前面——旧的那批已经被看过好几眼了。
+pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredProposal>> {
+    Ok(sqlx::query_as(
+        "SELECT section, key, payload, proposed_by, serves, signatures FROM ontology_proposals
+         WHERE kb_id = $1 AND status = 'open'
+         ORDER BY created_at DESC, key",
     )
-    .bind(relation_type_id)
-    .bind(subject_type_id)
-    .fetch_one(pool)
-    .await?;
-    Ok((declared > 0).then_some(ok > 0))
+    .bind(kb_id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// 这些类的全部祖先（不含自己）。沿 `subClassOf` 上溯，多继承与菱形都走得通。
@@ -1738,34 +2052,6 @@ pub async fn ancestors_of(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Uuid>> {
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-/// 同 [`subject_fits_domain`]，但类型**从库里的实体读**，不靠调用方手上那份。
-///
-/// 抽取器手上的 `entity_type_of` 只覆盖模型在这一块里声明过的实体；宾语常常
-/// 是别处已经存在的实体，这一块没重新声明它的类型，于是查不到、判不了。
-/// 而消解已经把它连到了库里那一行——那里有类型，用它才判得全。
-pub async fn entity_fits_domain(
-    pool: &PgPool,
-    relation_type_id: Uuid,
-    entity_id: Uuid,
-) -> AppResult<Option<bool>> {
-    let (declared, ok): (i64, i64) = sqlx::query_as(
-        "WITH RECURSIVE up(id) AS (
-             SELECT type_id FROM entities WHERE id = $2
-             UNION
-             SELECT p.parent_id FROM entity_type_parents p JOIN up ON p.child_id = up.id
-         )
-         SELECT (SELECT count(*) FROM relation_type_domains WHERE relation_type_id = $1),
-                (SELECT count(*) FROM relation_type_domains d
-                   JOIN up ON up.id = d.entity_type_id
-                  WHERE d.relation_type_id = $1)",
-    )
-    .bind(relation_type_id)
-    .bind(entity_id)
-    .fetch_one(pool)
-    .await?;
-    Ok((declared > 0).then_some(ok > 0))
 }
 
 /// 把 `owl:inverseOf` / `rdfs:subPropertyOf` 从 IRI 解析成 id。
@@ -1809,4 +2095,100 @@ pub async fn link_property_axioms_bulk(
     let inv = run("inverse_of", inverse).await?;
     let sub = run("sub_property_of", sub_property).await?;
     Ok((inv, sub))
+}
+
+#[cfg(test)]
+mod name_shape_tests {
+    use super::lower_camel;
+
+    #[test]
+    fn separators_become_camel_humps() {
+        assert_eq!(lower_camel("access to"), "accessTo");
+        assert_eq!(lower_camel("collaborated with"), "collaboratedWith");
+        assert_eq!(lower_camel("works_for"), "worksFor");
+        assert_eq!(lower_camel("date-applicability"), "dateApplicability");
+        // 连着几个分隔符只算一次
+        assert_eq!(lower_camel("called   for"), "calledFor");
+        assert_eq!(lower_camel("  start date  "), "startDate");
+    }
+
+    #[test]
+    fn only_the_first_letter_is_lowered() {
+        assert_eq!(
+            lower_camel("ApplicableCertificate"),
+            "applicableCertificate"
+        );
+        assert_eq!(lower_camel("EffectiveEndDateTime"), "effectiveEndDateTime");
+    }
+
+    /// **这条是这个函数存在的理由之一**：从 `key` 反推做不到，
+    /// `product_id` 拼回去只会得到 `productId`
+    #[test]
+    fn acronyms_are_left_alone() {
+        assert_eq!(lower_camel("productID"), "productID");
+        assert_eq!(lower_camel("hasLEI"), "hasLEI");
+        assert_eq!(lower_camel("accessibilityAPI"), "accessibilityAPI");
+        assert_eq!(
+            lower_camel("checkoutPageURLTemplate"),
+            "checkoutPageURLTemplate"
+        );
+    }
+
+    #[test]
+    fn already_right_is_untouched() {
+        for s in ["owns", "acceptedAnswer", "worksFor", "3DModel"] {
+            assert_eq!(lower_camel(s), s, "{s} 不该被动");
+        }
+    }
+
+    #[test]
+    fn idempotent() {
+        for s in ["access to", "ApplicableCertificate", "productID", "owns"] {
+            let once = lower_camel(s);
+            assert_eq!(lower_camel(&once), once, "{s} 归一两次结果要一样");
+        }
+    }
+}
+
+/// 两个数里的第二个（0061 决定 5）：代理的提案里，人表过态的有几条，其中拒掉的、改过再采纳的各几条
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct AgentProposalReport {
+    pub open: i64,
+    pub adopted: i64,
+    pub adopted_edited: i64,
+    pub rejected: i64,
+}
+
+/// 文档说了、本体还放不下的：没绑到类的类别词，和没绑到属性的短语形状（判成 none 的
+/// 与两票不一致的）。本体代理读的就是这两样（0061 决定 2）；工作台拿这两个数说「还缺什么」，
+/// 不再拿 0003 的 `ontology_misses`——开放图谱的抽取不往那张表里写
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct Uncovered {
+    pub kind_words: i64,
+    pub phrases: i64,
+}
+
+pub async fn uncovered(pool: &PgPool, kb_id: Uuid) -> AppResult<Uncovered> {
+    Ok(sqlx::query_as(
+        "SELECT (SELECT count(*) FROM type_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS kind_words,
+                (SELECT count(*) FROM phrase_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS phrases",
+    )
+    .bind(kb_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn agent_proposal_report(pool: &PgPool, kb_id: Uuid) -> AppResult<AgentProposalReport> {
+    Ok(sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status = 'open') AS open,
+                count(*) FILTER (WHERE status = 'adopted') AS adopted,
+                count(*) FILTER (WHERE status = 'adopted' AND edited) AS adopted_edited,
+                count(*) FILTER (WHERE status = 'rejected') AS rejected
+           FROM ontology_proposals WHERE kb_id = $1 AND proposed_by = 'agent'",
+    )
+    .bind(kb_id)
+    .fetch_one(pool)
+    .await?)
 }

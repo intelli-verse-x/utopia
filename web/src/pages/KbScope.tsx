@@ -15,6 +15,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ApiError, api } from "../api";
 import { S } from "../i18n";
 import { useKb } from "../kb";
+import { buttonLike, cn } from "../ui";
 import { kbStore, wsStore } from "../wsStore";
 
 /** 库不存在或没权限时的落地页。**不能只给一张空图**——分享链接最常见的
@@ -23,15 +24,15 @@ function KbNoAccess({ status }: { status: number }) {
   return (
     <div className="grid h-full place-items-center px-6">
       <div className="max-w-sm text-center">
-        <h2 className="text-[15px] text-neutral-200">
+        <h2 className="text-title text-ink">
           {status === 404 ? S.kbScope.missingTitle : S.kbScope.deniedTitle}
         </h2>
-        <p className="mt-2 text-xs leading-relaxed text-neutral-500">
+        <p className="mt-2 text-small leading-relaxed text-ink-2">
           {status === 404 ? S.kbScope.missingBody : S.kbScope.deniedBody}
         </p>
         <Link
           to="/account/kbs"
-          className="u-btn u-btn-ghost mt-4 inline-block px-3 py-1.5 text-xs"
+          className={cn(buttonLike("ghost"), "mt-4")}
         >
           {S.kbScope.myKbs}
         </Link>

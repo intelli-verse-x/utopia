@@ -93,7 +93,15 @@ pub struct Document {
     pub status: String,
     pub error: Option<String>,
     pub doc_time: Option<DateTime<Utc>>,
+    /// `doc_time` 从哪来：`content`（正文里读出）/ `source`（来源系统给的：发布时间、
+    /// 归档日期）/ `none`（没有日期）。上传时刻与文件修改时刻都不是文档的日期
+    /// （0045 决定 3，#714）：老值 `upload_time` / `file_mtime` 读作没有日期，见
+    /// [`Document::dated_at`]
     pub doc_time_source: String,
+    /// 文档的时间语境（0045 决定 3）：它自己的日期、它定义的期间与历法、叙述设下的锚点。
+    /// 服务端边抽取边填；`time_context_at` 是最近一次写下它的时刻
+    pub time_context: Option<serde_json::Value>,
+    pub time_context_at: Option<DateTime<Utc>>,
     /// 图谱抽取状态：none → queued → extracting → done | failed
     pub graph_status: String,
     /// 抽取失败原因（失败时才有）。与 error 分列——那列归解析管道，
@@ -106,8 +114,27 @@ pub struct Document {
     pub external_key: Option<String>,
     /// watch_folder 同步时发现源文件已消失（默认保留文档，仅标记）
     pub missing_since: Option<DateTime<Utc>>,
+    /// 墓碑（#268）：删除是认知轴上的一个事件。行、分块、证据、原始文件都留着，
+    /// 只是不再算活的；撤销、同步撞见、同内容重传都能把它复活
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// 真删（#268 下半）：内容已抹掉，回不来。行留作墓碑
+    pub purged_at: Option<DateTime<Utc>>,
+    /// 这份文件的字要靠哪一种模型读，而那种模型还没配：`ocr` / `transcribe`（0040）。
+    /// 文档此时是 failed；配上之后按它重新排进处理队列
+    pub reader_needed: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Document {
+    /// 文档自己的日期：只认正文或来源系统给的（`content` / `source`）。上传、同步、
+    /// 抽取的时刻是记录时间，不是文档的日期（0045 决定 3，#714）——别的来源一律 `None`
+    pub fn dated_at(&self) -> Option<DateTime<Utc>> {
+        match self.doc_time_source.as_str() {
+            "content" | "source" => self.doc_time,
+            _ => None,
+        }
+    }
 }
 
 /// 摄入来源（"来源即文件夹"：容器 + 定时同步）。
@@ -137,6 +164,153 @@ pub struct Source {
     pub created_at: DateTime<Utc>,
 }
 
+impl Source {
+    /// 这个来源下的文档要不要进抽取。
+    ///
+    /// **缺省是要。** 只有 config 里 `{"extract": false}` 明说了才不抽——schema
+    /// 文档就是这样（0035 决定 7）：它是给问数检索表结构的语料，不是事实的来源，
+    /// 进抽取的结果是每个列名变成一个实体。开关记在来源上而不是文档上，因为
+    /// 「只检索、不学习」是这一整个来源的性质；也没有拿来源的名字当规则，那是
+    /// 命名约定冒充类型保证（0009）。
+    ///
+    /// 值不是布尔的按没写处理：一个手滑不该让一整个来源静默停抽。
+    /// `documents::queue_extraction` 里的 SQL 判的是同一件事，改一处要改两处。
+    pub fn extracts(&self) -> bool {
+        self.config
+            .get("extract")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod source_extracts_tests {
+    use super::Source;
+
+    fn with(config: serde_json::Value) -> Source {
+        Source {
+            id: uuid::Uuid::nil(),
+            kb_id: uuid::Uuid::nil(),
+            kind: "folder".into(),
+            name: "x".into(),
+            config,
+            icon: None,
+            sync_interval_minutes: None,
+            sync_cron: None,
+            last_sync_at: None,
+            last_sync_status: "never".into(),
+            last_sync_error: None,
+            last_sync_added: 0,
+            ingest_token: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_false_turns_extraction_off() {
+        // 老来源的 config 是 `{}`，watch_folder 的是 `{"path": …}`：都照旧抽取
+        assert!(with(serde_json::json!({})).extracts());
+        assert!(with(serde_json::json!({ "path": "/x" })).extracts());
+        assert!(with(serde_json::json!({ "extract": true })).extracts());
+        // 不是布尔的按没写处理，而不是按 false
+        assert!(with(serde_json::json!({ "extract": "no" })).extracts());
+        assert!(with(serde_json::json!({ "extract": 0 })).extracts());
+        assert!(!with(serde_json::json!({ "extract": false })).extracts());
+    }
+}
+
+/// 来源配置里**用来鉴权**的那几个键。凭据只进不出：列表与创建 / 更新的响应都剔掉，
+/// 更新时客户端没传或传空串就保留库里的原值，审计里也不落。
+///
+/// **一张表，四处共用。** 此前那条规矩只对 `auth_header` 一个键成立，而对象存储、
+/// WebDAV、Notion 各自的密钥原样发给了每一个 Viewer（#246）。加连接器时**先加这里**，
+/// 再写读它的代码。`username` / `account_name` / `access_key_id` 这类是身份标识，
+/// 单独拿到鉴不了权，留着让界面显示得出「这是哪个账号」。
+pub const SOURCE_SECRET_KEYS: &[&str] = &[
+    "auth_header",
+    "token",
+    "password",
+    "secret_access_key",
+    "account_key",
+    "service_account_key",
+];
+
+impl Source {
+    /// 剔掉凭据后的这条来源——任何要回给客户端的 `Source` 都从这里过
+    pub fn without_secrets(mut self) -> Self {
+        if let Some(obj) = self.config.as_object_mut() {
+            for key in SOURCE_SECRET_KEYS {
+                obj.remove(*key);
+            }
+        }
+        self
+    }
+}
+
+/// 来源的种类。**一处定义，三处消费**：创建时的白名单、同步时的分派（按枚举穷举匹配，
+/// 加一种就得决定它怎么同步）、前端的下拉框（`web/src/sourceKinds.ts`，由
+/// `utopia-store` 的测试对表）。
+///
+/// 此前后端两张手写清单各自演进：五种连接器加了同步分支、进了界面，却没进创建的
+/// 白名单，界面上选得到、建的时候报「kind must be one of…」（#247）。变体顺序就是
+/// 对话框里的顺序；字符串形式由 strum 按 snake_case 生成，不再手写
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    strum::EnumIter,
+    strum::IntoStaticStr,
+    strum::EnumString,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum SourceKind {
+    Folder,
+    Url,
+    Rss,
+    GithubIssues,
+    GithubRepo,
+    JiraIssues,
+    S3,
+    AzureBlob,
+    Gcs,
+    Webdav,
+    Notion,
+    Api,
+    /// 推送的不是文档而是陈述本身（0054）：请求体就是开放抽取契约，抽取不问模型
+    Statements,
+    Custom,
+    /// 每个库自带的记忆来源，不可建不可删（0015）
+    Memory,
+    /// 老数据里 `sources.kind` 的默认值，没有对应的界面
+    Upload,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+
+    pub fn all() -> impl Iterator<Item = Self> {
+        <Self as strum::IntoEnumIterator>::iter()
+    }
+
+    /// 人能从界面建的：`memory` 与 `upload` 之外的全部
+    pub fn creatable_by_hand(self) -> bool {
+        !matches!(self, Self::Memory | Self::Upload)
+    }
+
+    pub fn creatable() -> impl Iterator<Item = Self> {
+        Self::all().filter(|k| k.creatable_by_hand())
+    }
+}
+
 /// 来源同步运行记录（渠道审计历史）。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct SyncRun {
@@ -160,6 +334,8 @@ pub struct ChunkFactView {
     /// 本体没认下这条关系时回落到原文说法；两者都拿不出时为 None（更早的历史数据长这样）
     pub predicate: Option<String>,
     pub inferred: bool,
+    /// A live open statement can supply a human-confirmed regression expectation.
+    pub is_open_statement: bool,
     pub object_id: Option<Uuid>,
     pub object: Option<String>,
     pub valid_from: Option<DateTime<Utc>>,
@@ -184,6 +360,33 @@ pub struct SourceView {
     pub doc_count: i64,
     /// 已标记"不在来源中"的文档数（url 全集对账 / custom 墓碑产生）
     pub missing_count: i64,
+    /// 全文补全那一块。**不是 RSS 的来源整块是 NULL**（0033 决定 2 / #417）。
+    /// 从前这里是八个平铺的列，而「不适用」在其中三个上写作 NULL、在另外五个
+    /// 上写作 0——一个文件夹来源会报 `queued_count: 0`，那是在谈一个它根本
+    /// 没有的队列。现在适不适用由这一格在不在说了算
+    #[sqlx(json(nullable))]
+    pub rss_full_content: Option<RssFullContentSummary>,
+}
+
+/// 一个 RSS 来源当前代的全文补全进度。
+///
+/// 五个计数只有凑在一起才有意义（Library 那条状态栏一次读完），所以一起走。
+/// `state` 是服务端算好的那一档，调用方不必拿 kind 与 content_mode 再推一遍。
+///
+/// **`generation` 与 `baseline_count` 不在这里**（0033 决定 2）：代号是内部状态，
+/// 基线那一批也不属于「还有多少活要干」这五个数——它是起点，不是进度。
+/// 要它们的地方读 `rss_full_content::counts`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RssFullContentSummary {
+    /// `pending`（还没建基线）| `active` | `disabled`（是 RSS，但没开全文）
+    pub state: String,
+    pub pending: i64,
+    /// queued 与 hydrating 合成一格
+    pub queued: i64,
+    pub retrying: i64,
+    pub complete: i64,
+    /// terminal、deleted、superseded 合成一格
+    pub terminal: i64,
 }
 
 /// 审计事件视图（带操作人显示名；删号后为 NULL）。纯审计展示用。
@@ -194,6 +397,9 @@ pub struct AuditEventView {
     pub target_kind: String,
     pub target_id: Option<Uuid>,
     pub detail: serde_json::Value,
+    /// NULL = 引擎自动（裁决器合并、一致性检查、推理物化……）。界面靠它把
+    /// 「没有人」和「人已被移除」分开：后者 actor_id 还在，只是查不到显示名
+    pub actor_id: Option<Uuid>,
     pub actor_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -227,6 +433,7 @@ pub struct ConversationMessage {
     pub content: String,
     pub steps: serde_json::Value,
     pub sources: serde_json::Value,
+    pub stopped: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -253,6 +460,25 @@ pub struct LlmSettings {
     pub embed_model: Option<String>,
     pub embed_dim: Option<i32>,
     pub updated_at: DateTime<Utc>,
+    /// 读扫描件、图片的版面识别服务（MinerU，0040）；空 = 没配，那类文件降级
+    pub ocr_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub ocr_api_key: Option<String>,
+    pub ocr_backend: Option<String>,
+    /// 读扫描件的服务是哪一种协议（0065）：`mineru` 交任务再问，`ark` 把每页送给视觉模型。
+    /// 已有的行默认 `mineru`
+    pub ocr_provider: String,
+    /// 方舟那一路的视觉模型名；MinerU 用不到
+    pub ocr_model: Option<String>,
+    /// 会标说话人的转写模型（OpenAI `/audio/transcriptions` + `diarized_json`，0040）
+    pub transcribe_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub transcribe_api_key: Option<String>,
+    pub transcribe_model: Option<String>,
+    /// 对话模型的推理强度（OpenAI 兼容口的 `reasoning_effort`）：none | minimal | low | medium |
+    /// high；空 = 不带字段。**每一种调用都用它**：抽取、对齐、提规则、本体代理、勘误——没有哪一步
+    /// 另外定一个。哪个值把思考关掉看端点：有的认 minimal，有的（DeepSeek）只认 none
+    pub chat_reasoning_effort: Option<String>,
 }
 
 impl LlmSettings {
@@ -261,6 +487,23 @@ impl LlmSettings {
     }
     pub fn embed_ready(&self) -> bool {
         self.embed_base_url.is_some() && self.embed_model.is_some()
+    }
+    /// MinerU 有地址就够；方舟还要模型名和密钥（它是收费的模型接口）
+    pub fn ocr_ready(&self) -> bool {
+        self.ocr_base_url.is_some()
+            && match self.ocr_provider.as_str() {
+                "mineru" => true,
+                "ark" => {
+                    self.ocr_model
+                        .as_deref()
+                        .is_some_and(|m| !m.trim().is_empty())
+                        && self.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty())
+                }
+                _ => false,
+            }
+    }
+    pub fn transcribe_ready(&self) -> bool {
+        self.transcribe_base_url.is_some() && self.transcribe_model.is_some()
     }
 }
 
@@ -341,34 +584,41 @@ pub struct RelationTypeView {
     /// 可以当宾语的类。**只对 relation 有意义**——attribute 的值域是字面量类型，
     /// 落在 datatype 上
     pub ranges: Vec<Uuid>,
+    /// 这条关系的边能带哪些属性（0037）：属性定义的 id。
+    /// **本体接口一直没给这一格**——0037 第一刀把它加进了 `graph::relation_types`
+    /// 与前端类型，却漏了这个视图，于是本体页点开一条关系时前端读到 undefined
+    /// 直接抛（`rel.qualifiers.length`）。
+    pub qualifiers: Vec<Uuid>,
     /// attribute 专用：text | number | date | bool
     pub datatype: Option<String>,
     pub unit: Option<String>,
     pub usage: i64,
 }
 
-/// 抽取未匹配统计（本体扩展建议的信号源）。
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct OntologyMiss {
-    pub kind: String,
+/// 一条边上挂的一个属性值（0037）。`value` 与 `entity` 二选一：
+/// 金额、比例、日期是字面值；「经 C 撮合」里的 C 是实体（这一格这一刀还不写，位置留着）
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactQualifier {
+    pub qualifier_type_id: Uuid,
     pub key: String,
-    pub example: Option<String>,
-    pub count: i32,
+    pub label: String,
+    /// 形状与 `facts.object_value` 一致：{"value": …, "unit": …}
+    pub value: Option<serde_json::Value>,
+    pub entity_id: Option<Uuid>,
+    pub entity_name: Option<String>,
 }
 
-/// 一个待认领的表层谓词：原文这么说过，但本体里没有对应关系，事实降级成了
-/// related_to。与 `OntologyMiss` 的纯计数不同，它连着具体事实——所以采纳时
-/// 能说清"将重新归类 57 条"，并真的去改。
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct ProposedPredicate {
-    pub form: String,
-    /// 有多少条 live 的 related_to 事实由这个说法而来
-    pub fact_count: i64,
-    /// 出现在多少篇文档里。只在一篇里出现过的是那篇文档的用词，不是这个
-    /// 组织的词汇——自动扩展据此设门槛，人工提案只作参考不拦
-    pub doc_count: i64,
-    /// 一条样例（"Dino Crisis (Steam) → GeForce NOW"），让人一眼判断这是什么关系
-    pub example: Option<String>,
+/// 开放陈述上的一个属性（0044 第一刀、0061）：按文档的角色词记，不按本体属性——没有
+/// `qualifier_type_id`，所以不混进 [`FactQualifier`]（RDF 导出靠那一格拼 IRI）。
+/// 值或实体二选一；实体那一格带上它的显示名。物化出来的类型化行带着抄过去的那一份
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatementQualifier {
+    /// 文档自己的角色词（"amount"、"buyer"）
+    pub role: String,
+    /// 形状与 [`FactQualifier::value`] 一致：{"value": …}
+    pub value: Option<serde_json::Value>,
+    pub entity_id: Option<Uuid>,
+    pub entity_name: Option<String>,
 }
 
 /// 一次 OWL 导入的记录。原文按内容寻址存在 blob 里，这行只是账。
@@ -392,17 +642,6 @@ pub struct ModelLimit {
     pub base_url: String,
     pub model: String,
     pub max_concurrent: i32,
-}
-
-/// 一个待认领的实体类型：模型提议过、本体没有、实体因此降级成了 concept。
-/// 与 `ProposedPredicate` 对称——它连着具体实体，所以采纳时能说清"将重新归类
-/// 43 个"并真的去改，而不是只建一个空类。
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct ProposedType {
-    pub form: String,
-    pub entity_count: i64,
-    /// 一个样例名字，让人一眼判断这是什么类
-    pub example: Option<String>,
 }
 
 /// 抽取丢弃信号：事实抽出来了却没能落地，以及为什么。
@@ -444,6 +683,10 @@ pub struct RelationType {
     /// attribute 专用：text | number | date | bool
     pub datatype: Option<String>,
     pub unit: Option<String>,
+    /// **这条关系的边能带哪些属性**（0037）：指向 kind='attribute' 的行。
+    /// `A invested B` 上的「金额」是边自己的属性，不是第二个宾语；金额的
+    /// datatype / unit / 换算全复用属性定义，只是它的 domain 是一条关系而不是一个类
+    pub qualifiers: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -454,7 +697,6 @@ pub struct Entity {
     /// 是「抽取器抽到了东西，但本体里没有对应的类」这个状态
     pub type_id: Option<Uuid>,
     pub canonical_name: String,
-    pub aliases: Vec<String>,
     pub merged_into: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -487,6 +729,10 @@ pub struct GraphEdge {
     /// 两个来源都拿不出时为 None——那是 add_evidence 记录原文说法之前的老数据
     pub predicate: Option<String>,
     pub label: Option<String>,
+    /// 这条类型化边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1，#755）。
+    /// 画布把一条陈述只画一条边：有类型化行就画它，标签是属性的名字——原话不能因此
+    /// 从画面上消失，它跟在这一格里。几条陈述算出同一行时是它们的原话，去重后拼起来
+    pub said_as: Option<String>,
     /// true = 这条边的名字来自原文，不是本体认下的关系。界面要显示得看得出区别
     pub inferred: bool,
     /// true = 这条边是**推出来的**，不是任何人断言的（R1，住在 `derived_facts`）。
@@ -494,6 +740,12 @@ pub struct GraphEdge {
     /// **与 `inferred` 不是一回事**，尽管两个词很近：那一位说的是「名字来自原文
     /// 而不是本体」，这一位说的是「这条边根本不是谁说的，是引擎推的」
     pub derived: bool,
+    /// 边上的属性（0037）：画布把金额写到边的标签上要靠它
+    #[sqlx(skip)]
+    pub qualifiers: Vec<FactQualifier>,
+    /// 按文档角色词记的属性（0061，#1267）：与 `qualifiers` 分开，没有就是空列表
+    #[sqlx(skip)]
+    pub statement_qualifiers: Vec<StatementQualifier>,
     /// 推它出来的那条规则（`transitive` / `symmetric` / `inverse` / `sub_property`）；
     /// 断言的边为 None。
     ///
@@ -509,13 +761,48 @@ pub struct GraphEdge {
     pub premises: Vec<Uuid>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
+    /// **读出来的**区间（0022）：没有起点的事实从最早的证据起，结束了不知哪天的
+    /// 到最早说出它的那份文档为止。滑杆按这两个过滤，不再自己解释 NULL——
+    /// 上面那两个是原文说了什么，只用来显示
+    pub holds_from: Option<DateTime<Utc>>,
+    pub holds_to: Option<DateTime<Utc>>,
     pub confidence: f32,
+    /// 有争议（0017 §3）：有一条 open 的公理违规或时态冲突指着它。整条边画成
+    /// 警戒色——环在节点上、边还是灰的，余光分不出来
+    pub contested: bool,
+    /// 幽灵边（0017 §3）：一条**没有落地**的派生——推出来了却撞上断言。`id` 是那条
+    /// `derived_contradiction` 违规的 id，不是任何事实；`derived` 同时为 true，
+    /// 所以它跟着派生开关走
+    pub blocked: bool,
+}
+
+/// 一个实体的一个名字（0041）：`known_as` 上的一条值事实，单独成一栏，不混进事实行。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct NameView {
+    pub fact_id: Uuid,
+    pub name: String,
+    /// 界面上显示的那个名字（`entities.canonical_name`）
+    pub canonical: bool,
+    pub recorded_at: DateTime<Utc>,
+    /// 世界轴：曾用名在这里有一个结束
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_from_precision: Option<String>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub valid_to_precision: Option<String>,
+    pub document_ids: Vec<Uuid>,
+    pub evidence_count: i64,
 }
 
 /// 实体详情页的事实行（时间线）。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityFact {
     pub id: Uuid,
+    /// 这条类型化事实是从哪条开放陈述算出来的，那条陈述的原话（#755）
+    pub said_as: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+    pub invalidated_at: Option<DateTime<Utc>>,
+    pub supersedes: Option<Uuid>,
+    pub document_ids: Vec<Uuid>,
     /// out = 该实体为主语；in = 为宾语
     pub direction: String,
     /// 本体没认下这条关系时回落到原文说法；两者都拿不出时为 None（更早的历史数据长这样）
@@ -527,8 +814,16 @@ pub struct EntityFact {
     pub temporal: Option<String>,
     pub other_id: Option<Uuid>,
     pub other_name: Option<String>,
+    /// 对端实体的类型标签；属性事实没有对端时为 None
+    pub other_type: Option<String>,
     /// 字面值宾语（属性事实/问数映射）：{"value":…,"unit":…} 或 {"summary":…}
     pub object_value: Option<serde_json::Value>,
+    /// 边上的属性（0037）。不在行里——`fact_qualifiers` 另一张表，加载后按事实 id 补
+    #[sqlx(skip)]
+    pub qualifiers: Vec<FactQualifier>,
+    /// 按文档角色词记的属性（0061，#1267）：`statement_qualifiers` 那张表，同样加载后补
+    #[sqlx(skip)]
+    pub statement_qualifiers: Vec<StatementQualifier>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     /// 精度描述的是这条事实**有的那些日期**的粒度。两端都没有日期时为 None——
@@ -538,14 +833,46 @@ pub struct EntityFact {
     /// 结束端的粒度，外加一个 `unknown`——**原文说它结束了，但没说哪天**。
     /// `valid_to` 与它都为 None 才是「仍在持续」（见 `facts.valid_to_precision`）
     pub valid_to_precision: Option<String>,
+    /// **读出来的**区间（0022），与 `GraphEdge` 同义：面板判「此刻成立」按它，
+    /// 不再自己把 NULL 解释成开放
+    pub holds_from: Option<DateTime<Utc>>,
+    pub holds_to: Option<DateTime<Utc>>,
+    /// 见证从文档的哪条日期来，照文档的字（0064）：「提报日期 2026年9月4日」。没有起点的
+    /// 事实，`holds_from` 就是这个见证的日期——它是「截至」，不是起点
+    #[sqlx(default)]
+    pub attested_by: Option<String>,
     pub confidence: f32,
     pub evidence_count: i64,
     /// 证据全部停留在来源文档的旧版（未被现行内容确认；不代表事实失效）
     pub stale: bool,
     /// 修正行（supersedes 链上）：区间闭合来自引擎对账/人工裁决而非抽取原文
     pub corrected: bool,
+    /// 终点是时间线推出来的（`facts.end_derived`）：后一条事实开始时引擎把它关上，原文没说
+    /// 这一天（#970）
+    pub end_derived: bool,
+    /// `valid_to` 仍是存的边界；true 说原文讲的是在它之前结束的那个时段（`facts.end_after_period`，
+    /// #994）：「2024 年离开」存 2025-01-01，原文说的是 2024
+    pub end_after_period: bool,
+    /// 区间是人改过的（#970）：`corrected_ends` 有值。与 `corrected` 不同，那一位是任何一次
+    /// 改写：自动接续、审阅裁决、人手改
+    pub time_corrected: bool,
+    /// 人改过哪一端：`start` / `end` / `both`（`facts.corrected_ends`，随修正行写下）。终点后来
+    /// 是时间线推出来的，就不再算终点被人改过
+    pub corrected_ends: Option<String>,
+    /// 时间线把它关上时接的那一行（#970 第二步）：只在 `end_derived`、而且找得到时有
+    pub closed_by_id: Option<Uuid>,
+    /// 接的那一行变了的那一端：接任者，或新的宾语实体的名字
+    pub closed_by: Option<String>,
+    /// 接的那一行的新值（属性事实）
+    pub closed_by_value: Option<serde_json::Value>,
+    /// 人改区间时写下的备注：链上最近那一次修正的
+    pub correction_note: Option<String>,
     /// 证据集合里最新的文档时间——开放事实的"最后确认时间"（时效性透明化）
     pub last_evidence_time: Option<DateTime<Utc>>,
+    /// 有争议（0017 §3）：`{ kind, ref_id, derived? }`——哪一种（违规的 kind，或
+    /// `temporal_conflict`）、Review 里那一项的 id、派生撞断言时推出来的那句话。
+    /// 一条只报最新的一处；行**不压暗**，断言仍然活着
+    pub contested: Option<serde_json::Value>,
 }
 
 /// 实体的一次认知变更（记录时间轴上的事件，与 EntityFact 的有效时间轴正交）。
@@ -626,6 +953,8 @@ pub struct GraphChange {
     pub document_id: Option<Uuid>,
     pub filename: Option<String>,
     pub quote: Option<String>,
+    /// 这条引文从哪来（0040）：stated / ocr / transcribed / described；没有证据为空
+    pub quote_origin: Option<String>,
 }
 
 /// 消解审核项的一侧实体摘要。
@@ -641,6 +970,17 @@ pub struct ReviewSide {
     pub top_facts: Vec<String>,
 }
 
+/// agent 在一对上留下的、还开着的建议（0025）：卡片上挂一个标签，人在卡片上
+/// 的裁决就是对它的回答
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ReviewProposal {
+    pub id: Uuid,
+    /// merge | keep | unsure
+    pub action: String,
+    pub confidence: f32,
+    pub reason: Option<String>,
+}
+
 /// 消解审核项：疑似同一实体的灰区对。
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewItem {
@@ -652,6 +992,8 @@ pub struct ReviewItem {
     pub created_at: DateTime<Utc>,
     pub left: ReviewSide,
     pub right: ReviewSide,
+    /// agent 的建议，没有就是 None
+    pub proposal: Option<ReviewProposal>,
 }
 
 /// 合并日志行（审核页历史区）。
@@ -696,13 +1038,46 @@ pub struct EvidenceView {
     pub doc_version: i32,
     /// 文档已有更新的版本（证据停留在旧版；不代表事实失效）
     pub stale: bool,
+    /// 这条证据所在的文档已被删除（#268）。事实若还活着，是因为它另有出处
+    pub document_deleted: bool,
+    /// 引文从哪来（0040）：`stated` 文件里写的、`ocr` 扫描页上认出来的、`transcribed`
+    /// 录音转写、`described` 模型对一张图的描述——最后一种没有原话可对
+    pub origin: String,
+    /// 读出这段文字的引擎或模型；原文为空
+    pub origin_model: Option<String>,
+    /// 指回原文件的位置：页码（和框）、录音起止毫秒与说话人、图在哪一页
+    pub anchor: Option<serde_json::Value>,
+}
+
+/// 这个库走到哪一步了（#313）：四个页面的空状态共用同一个判断。
+///
+/// 每个页面此前都各自假设「已经就绪」，于是空状态只会说同一句话：图谱页
+/// 让人去配模型，哪怕文档正在抽取；对话页照常显示问候语，哪怕模型根本没配——
+/// 用户问出第一句才撞墙。
+///
+/// **只回布尔与计数。** 模型那一项来自工作区设置，而那张表要 workspace admin
+/// 才看得到（`settings_routes::get`）。普通成员看不到配置，却需要知道配没配，
+/// 所以这里只说「有没有」，不带 base_url、模型名或任何凭据。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct Readiness {
+    /// 工作区配了对话模型。没有它，抽取与对话都跑不起来
+    pub has_chat_model: bool,
+    /// 活文档数（墓碑不算——删掉的文档不构成「库里有东西」）
+    pub documents: i64,
+    /// 正在解析或抽取的文档数
+    pub processing: i64,
+    /// 解析或抽取失败的文档数
+    pub failed: i64,
+    /// 图里的实体数。文档齐了、抽取也跑完了，这个还是 0 说明什么都没抽出来
+    pub entities: i64,
 }
 
 /// 时态冲突（S3 自动闭合拿不准的那些）：旧事实 vs 新事实，Review 页人裁。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConflictView {
     pub id: Uuid,
-    /// no_time | simultaneous | low_confidence
+    /// no_time | simultaneous | described_evidence（`low_confidence` 是 0045 第 3 刀
+    /// 之前记下的，历史行还带着它）
     pub reason: String,
     pub created_at: DateTime<Utc>,
     pub predicate_label: String,
@@ -724,6 +1099,10 @@ pub struct ChunkFull {
     pub id: Uuid,
     pub seq: i32,
     pub text: String,
+    /// 这块文字从哪来（0040）：查看器按它标出认出来的字，按锚点翻到那一页
+    pub origin: String,
+    pub origin_model: Option<String>,
+    pub anchor: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -745,15 +1124,32 @@ pub struct KnowledgeBase {
     /// 内置本体按哪种语言播种，以及新的类/关系描述写成哪种语言（`en` | `zh`）。
     /// **跟语料走，不跟界面走**——description 的读者是正在读这些文档的模型。
     /// 见 docs/decisions/0004。
-    /// 是否把推出来的事实写进账本（R1）。**缺省关**——这一步往图里加东西，
-    /// 而 0001 判据 2 说「本体是引导不是执法」：声明可能是错的，不该在用户
-    /// 没表态时就按它改图
+    /// 是否把推出来的事实写进账本（R1）。**缺省开**（0050）：派生事实带标记、
+    /// 单列一段、随时整片撤得掉，改的不是账本里人写的那部分；而关着的代价是
+    /// 新库的图一直缺传递链和对称对，人得先发现这个开关才看得见该看见的边
     pub materialize_inferences: bool,
+    /// 抽取结束自动排一轮类型消解（0016 C2）。**只自动落地在原类子树里精化的那一档**，
+    /// 跨轴的改判仍留给人。缺省开：基准上自动那一档的命中 39/41（#297），且每批可撤
+    pub auto_type_resolution: bool,
+    /// 治理开关（0025，**缺省开**，见 0050）：开着，govern 任务按先进先出过等人的
+    /// 重复对，先读台账里人的先例再裁；关掉，任务在两簇之间看到就停
+    pub governance: bool,
+    /// 这次打开治理的时刻；保险丝只数它之后的撤回（0025 决定 9）。
+    /// 新库生下来就开着治理，这一格于是等于建库的时刻（0050）
+    pub governance_since: Option<DateTime<Utc>>,
     /// 多久重推一次（分钟）。见 `knowledge_bases.inference_interval_minutes`
     pub inference_interval_minutes: i32,
     /// 上次推完的时间。**答的是「上次看过没有」，不是「上次改过没有」**
     pub last_inference_at: Option<DateTime<Utc>>,
     pub ontology_lang: String,
+    /// 探索从 schema 写的数据描述：一行是什么、键、单位、码值、时间轴、相似列。
+    /// 只写 schema 说了的；每次探索重写
+    pub data_description: Option<String>,
+    /// 探索拿不准、需要库的主人答的问题（JSON 字符串数组）
+    pub data_questions: serde_json::Value,
+    /// 人写的约定：「测试单不算数」「有效订单是 2/3/4」这类 schema 里没有的规则。
+    /// 探索不碰它——量过：宽表语料上问数没有约定 2/18，有 14/18（#520）
+    pub data_conventions: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -796,27 +1192,6 @@ pub struct TypeCandidate {
     pub distance: f32,
 }
 
-/// 一个被记下来、但本体里没有对应属性的**字面值**说法。
-///
-/// 跟 [`ProposedPredicate`] 是一对：那个是宾语指向实体的（"收购"），
-/// 这个是宾语是字面值的（"成立日期 = 2015"）。两者不能混——提案要产出的东西
-/// 不一样（关系 vs 属性），而混起来的后果具体：一条 `founding_date` 会变成
-/// 一条指向「2015」这个假实体的边。
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct ProposedAttribute {
-    pub form: String,
-    pub fact_count: i64,
-    pub doc_count: i64,
-    /// 一条样例值（`"2015"`、`1200`），让人一眼看出这是什么类型的数
-    pub example: Option<String>,
-    /// 这个说法**实际挂在哪些类上**（主语的类型）。
-    ///
-    /// 属性必须声明 domain，而 domain 猜错的代价是硬的：主语类型对不上
-    /// 就整条丢弃（`attr_domain_mismatch`）。所以不问模型，直接从数据里取——
-    /// 事实已经在那儿了，它们的主语是什么类是事实，不是判断
-    pub domain_keys: Vec<String>,
-}
-
 /// 一条口径改动之前的样子。
 ///
 /// **存整版快照而不是差异**（0006）：读的时候要回答的是「当时是什么」，
@@ -830,6 +1205,35 @@ pub struct MappingRevision {
     /// 真被硬删过才会是 NULL
     pub changed_by_name: Option<String>,
     pub changed_at: DateTime<Utc>,
+}
+
+/// 一轮映射探索扫了什么、丢了什么、剩下什么（#503）。
+///
+/// **它回答的是覆盖率**：十一条提议对着一张八十列的宽表，与十一条刚好覆盖完
+/// 一个小库，从 `concept_mappings` 里看长得一模一样。分子是 `tables_covered`，
+/// 分母是 `tables_scanned`，而 `schema_truncated` 说明覆盖不全是「没看见」
+/// 还是「看见了没提」。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ExplorationRun {
+    pub id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub sources: Vec<String>,
+    pub tables_scanned: i32,
+    pub columns_scanned: i32,
+    /// schema 文本撞了上限：提示词里没有的表，模型没有机会提
+    pub schema_truncated: bool,
+    /// 这一轮允许提几条（按表数放大）
+    pub cap: i32,
+    /// 模型回了几条 / 落库几条。两者之差是被丢掉的，明细在 `dropped`
+    pub returned: i32,
+    pub accepted: i32,
+    /// `{"source": {"n": 12, "example": "…"}, …}`，键见
+    /// `utopia_store::exploration_runs::drop_reason`
+    pub dropped: serde_json::Value,
+    pub tables_covered: Vec<String>,
+    /// 跑挂了的那一轮也留一行——失败与「跑了但什么都没提」不是一回事
+    pub error: Option<String>,
 }
 
 /// 语义层的一条映射：业务概念 → 数据资产定义（见 `docs/decisions/0011`）。
@@ -858,16 +1262,19 @@ pub struct ConceptMapping {
     /// **状态而不是置信度。** 从前借事实的 confidence 表达「提议 0.6 / 确认 1.0」，
     /// 那是把二值状态编码成浮点数，还顺带让它落进「低置信事实」那一档
     pub status: String,
+    /// 人从零写的口径记写的人；探索提的为空（#562）。`decided_by` 分不出这件事——
+    /// 探索提的经人确认之后同样有 decided_by
+    pub written_by: Option<Uuid>,
 }
 
 /// 一处公理违规，配好展示所需的三元组文本（见 `axiom_violations`）。
 ///
 /// **两条事实都展开成 主-谓-宾 文本**：Review 页要让人一眼看出矛盾在哪，
 /// 而两个 UUID 看不出任何东西。自反那一类两条相同——它就是一条事实。
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AxiomViolation {
     pub id: Uuid,
-    /// self_loop | asymmetry | cycle | functional
+    /// self_loop | asymmetry | cycle | functional | inverse_functional | signature | derived_contradiction
     pub kind: String,
     /// 判据来自哪条关系。人若判「公理写错了」，从这里进本体去改
     pub predicate: Option<String>,
@@ -875,9 +1282,25 @@ pub struct AxiomViolation {
     pub left_text: String,
     pub right_fact: Uuid,
     pub right_text: String,
-    /// 环的长度（含首尾）。其余三类为 0——前端据此决定要不要显示「查看路径」
+    /// `path` 的长度：环上的事实（含首尾）、互斥组里的事实、派生的前提。自环与签名为 0
     pub path_len: i32,
     pub detected_at: chrono::DateTime<chrono::Utc>,
+    /// `derived_contradiction` 独有（0017）：推出来的那条三元组——它没有落库，
+    /// 只能在这里写出来。字段见 `reasoning::run`。其余种类是 `{}`
+    pub detail: serde_json::Value,
+    /// 审核线索（0017 §2）：`stale`（旧断言没写结束日期）、`duplicate`（有同名
+    /// 实体）、`unsure`（抽取置信度低）。只给一条，没有就空
+    pub hint: Option<String>,
+    /// 环上的每一条事实，按顺序（其余种类为空）。**逐条给 id**：撤事实要说撤哪条，
+    /// 而环上哪条错了只有人看了才知道（#202）
+    pub path: Vec<ViolationFact>,
+}
+
+/// 违规里的一条事实：id 与三元组文本
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViolationFact {
+    pub id: Uuid,
+    pub text: String,
 }
 
 /// 本体自己的一处自相矛盾（见 `ontology_defects`）。
@@ -888,8 +1311,11 @@ pub struct AxiomViolation {
 pub struct OntologyDefect {
     pub id: Uuid,
     /// symmetric_and_asymmetric | transitive_and_functional | subclass_cycle
-    /// | disjoint_with_ancestor | inherits_disjoint
+    /// | disjoint_with_ancestor | inherits_disjoint | inverse_of_itself
+    /// | inverse_not_mutual | sub_property_cycle | rules_disagree
     pub kind: String,
+    /// `rules_disagree` 独有（0017）：哪两条规则、撞在哪条公理上、几对、几个例子
+    pub detail: serde_json::Value,
     /// 出问题那个对象的标签（类或谓词）。查不到就是它已经被删了
     pub subject_label: Option<String>,
     /// 另一方：互斥的那个类
@@ -906,13 +1332,26 @@ pub struct OntologyDefect {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct DerivedFactView {
     pub id: Uuid,
+    pub predicate_id: Uuid,
+    pub object_value: Option<serde_json::Value>,
+    pub rule_id: Option<Uuid>,
+    pub attribute_rule_id: Option<Uuid>,
+    pub invalidated_at: Option<DateTime<Utc>>,
+    pub valid_from_precision: Option<String>,
+    pub valid_to_precision: Option<String>,
     pub subject_id: Uuid,
     pub subject: String,
-    pub object_id: Uuid,
+    /// 字面值结论（业务规则的归类与属性）没有实体宾语（0021）
+    pub object_id: Option<Uuid>,
     pub object: String,
     pub predicate: String,
-    /// transitive | symmetric——靠哪条规则推的
+    /// transitive | symmetric | inverse | sub_property，或 `business`（业务规则）
     pub rule: String,
+    /// 业务规则的名字。公理推的为 None——公理没有名字，`rule` 那一列就是它的全部身份
+    pub rule_name: Option<String>,
+    /// 凭业务规则定义的哪一版推出的（0060），和那一版的定义本身。公理推的为 None
+    pub rule_version: Option<i32>,
+    pub rule_definition: Option<serde_json::Value>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     pub confidence: f32,
@@ -921,21 +1360,301 @@ pub struct DerivedFactView {
     pub premises: Vec<String>,
 }
 
+/// 一条**没有落地**的派生（0017 §3）：推出来了，撞上一条断言，拦在图外。
+///
+/// 它没有 id——落库的才有。这里用那条 `derived_contradiction` 违规的 id 指它，
+/// 面板上的「没落地的」一档与图上的幽灵边都靠这个 id 对上 Review 里的卡片。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct BlockedDerivation {
+    pub violation_id: Uuid,
+    pub subject_id: Uuid,
+    pub subject: String,
+    pub object_id: Uuid,
+    pub object: String,
+    pub predicate: String,
+    pub rule: String,
+    /// 声明所在的谓词
+    pub via_label: String,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    /// 挡住它的那条断言，与它的三元组文本
+    pub against_fact: Uuid,
+    pub against_text: String,
+    /// 前提事实 id，按推导顺序——证明链从这里展开
+    pub premises: Vec<Uuid>,
+}
+
+/// 证明的一步：一条前提，连同它的证据（0002 R2）。
+///
+/// 前提要么是断言——叶子就是它的原句（chunk）——要么是**另一条派生**（0030），
+/// 那一步的证据是它自己的前提，在 `premises` 里再往下一层。所以证明是一棵树，
+/// 深度与推理同一条上限。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofStep {
+    pub seq: i32,
+    /// 断言时是 `facts.id`，派生时是 `derived_facts.id`——看 `derived`
+    pub fact_id: Uuid,
+    /// 这一步自己是推出来的（0030）。**界面要分得出**：一条推出来的前提与
+    /// 一条读来的前提在句子上长得一样，而它们能不能追到原文完全不同
+    pub derived: bool,
+    pub subject_id: Uuid,
+    pub subject: String,
+    pub predicate_id: Option<Uuid>,
+    /// 本体里的关系名；空谓词事实（0010）不参与推导，这里理论上恒有值，
+    /// 留 Option 是不在读路径上撒谎
+    pub predicate: Option<String>,
+    pub object_id: Option<Uuid>,
+    pub object: Option<String>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub confidence: f32,
+    /// 这条前提后来被撤了。派生随之失效，但证明还要读得出「当时靠的是什么」
+    pub retracted: bool,
+    pub evidence: Vec<EvidenceView>,
+    /// 这一步自己的前提，按 `seq`（0030）。断言那一步是空的——它的叶子是
+    /// `evidence` 里的原句，不必再往下问
+    pub premises: Vec<ProofStep>,
+}
+
+/// 一条派生事实的完整证明：它本身，加上按顺序展开到原句的前提。
+#[derive(Debug, Clone, Serialize)]
+pub struct Proof {
+    pub derived: DerivedFactView,
+    pub steps: Vec<ProofStep>,
+}
+
 /// 审核队列各档的**真实条数**。
 ///
 /// 与列表分开取是有意的：列表有上限（一页十条），数数没有。从前左栏读的是
 /// 数组长度，而接口固定只回 100 条——一个有 164 条待办的库，界面写着 100，
 /// 清完还会再冒出来。
+/// 等人点头的一条事实（0015）。`quote` 是那句记忆的全文——确认界面要把原句和
+/// 三元组并排显示，只列三元组等于要人凭空判断它对不对。
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct PendingFactView {
+    pub id: Uuid,
+    pub subject_id: Uuid,
+    pub subject_name: String,
+    pub predicate_id: Option<Uuid>,
+    /// 本体里的关系名；为空时前端显示 `proposed_predicate`（斜体，标明是原话）
+    pub predicate_label: Option<String>,
+    pub proposed_predicate: Option<String>,
+    pub object_id: Option<Uuid>,
+    pub object_name: Option<String>,
+    pub object_value: Option<serde_json::Value>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_from_precision: Option<String>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub valid_to_precision: Option<String>,
+    pub confidence: f32,
+    pub chunk_id: Uuid,
+    pub quote: String,
+    pub proposed_by: Option<Uuid>,
+    pub proposed_by_name: Option<String>,
+    /// 经 MCP 记进来时，那枚令牌的名字（0014 里人给 agent 起的名）。
+    /// 网页端对话记的记忆这一位是空的——那时「谁说的」就是那个人本人
+    pub proposed_token_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// 文档自己的关系短语（0044）。Some = 这是一条开放陈述：点头后按 `layer = 'open'`
+    /// 落进 `facts`，短语照写、没有谓词、不写 `valid_*`；None = 老的带本体形状
+    pub phrase: Option<String>,
+    /// 开放陈述按文档角色词记的属性：`[{"role": "amount", "value": "$2 million"} |
+    /// {"role": "to", "entity_id": "<uuid>"}]`。只在 `phrase` 非空时有意义
+    pub qualifiers: Option<serde_json::Value>,
+    /// 陈述提到的时间词，**照抄，永远不是日期**（0045）：
+    /// `[{"text": "March 4, 2011", "char_start": 143}]`，偏移是 `chunks.text` 里的字符偏移
+    pub time_words: Option<serde_json::Value>,
+    /// 引文在 `chunks.text` 里的字符偏移（不是字节），服务端搜文本算出；NULL = 没定位到
+    pub quote_start: Option<i32>,
+    pub quote_end: Option<i32>,
+}
+
+/// 一句记忆是谁提的。
+///
+/// **两层，不是一层**：`user_id` 是人（令牌代表的就是他，0014），`token_id` 是
+/// 他挂在这个库上的哪一个 agent。同一个人可以同时连着三个客户端，只记人
+/// 就等于让审核的人在三条一模一样的「张三说的」之间猜。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Proposer {
+    pub user_id: Option<Uuid>,
+    /// None = 不经 MCP（网页端对话，或批量摄入）
+    pub token_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, sqlx::FromRow)]
 pub struct ReviewCounts {
+    /// 记忆抽出、等人点头的事实（0015）。排第一：它是人自己说的话
+    pub pending: i64,
     pub duplicates: i64,
+    /// 重复项里两边类型相同（都有类型且相等）的——同名同类是人最先想批量合的一档（#428）
+    pub duplicates_same_type: i64,
+    /// 两边类型冲突（都有类型且不等）的——同名异义，合了就错
+    pub duplicates_type_conflict: i64,
     pub conflicts: i64,
     pub unconfirmed: i64,
     pub lowconf: i64,
     pub mappings: i64,
     pub violations: i64,
+    /// 对齐器两票不一致的签名与类别词（#725 对齐队列）
+    pub alignment: i64,
+    /// 勘误 agent 被闸门拦下、等人答的动作（0044 决定 7）
+    pub errata: i64,
     pub defects: i64,
     pub merges: i64,
+    /// agent 写下、等人回答的建议（0025）
+    pub agent: i64,
+    /// agent 的全部记录（Agent 队列翻页用）
+    pub agent_rows: i64,
+    /// 这个库的 govern 任务此刻在跑
+    pub agent_running: bool,
+    /// 等 agent 看的对：等人的重复对里还没有建议的
+    pub agent_queue: i64,
+}
+
+/// agent 的一笔（0025）：看了哪一对、想怎么办、凭什么、人怎么答的。
+/// `left` / `right` 是那一对的名字，合并之后仍按当时的实体读得出
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct AgentDecisionView {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub target_kind: String,
+    pub target_id: Uuid,
+    /// merge | keep | unsure
+    pub action: String,
+    pub confidence: f32,
+    pub reason: Option<String>,
+    pub precedents: serde_json::Value,
+    /// proposed | applied | accepted | overridden | reverted | superseded
+    pub status: String,
+    pub merge_id: Option<Uuid>,
+    /// defer 留给人的那一个问题；只有 unsure 的行才有
+    pub question: Option<String>,
+    /// 它看了什么：[{tool, args, note}]
+    pub trace: serde_json::Value,
+    /// 循环里花的模型调用次数
+    pub calls: i32,
+    pub created_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by_name: Option<String>,
+    pub left: Option<String>,
+    pub right: Option<String>,
+}
+
+/// 批量裁决里一条的结果：`error` 为 None 就是成功。一条失败不拖累其余的，
+/// 调用方拿到逐条说明，界面上能指着说「这两条没成，为什么」
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewBatchOutcome {
+    pub id: Uuid,
+    pub error: Option<String>,
+}
+
+/// 审核台的总览（#377）：等着办的、办过的、库的成色。
+///
+/// 左栏的七个数只说「开着多少条」；总览要回答的是一个审核者进来时的三个
+/// 问题——**有多少在等、等了多久、队列在消还是在涨**。三段各自一组查询，
+/// 拼在一起一次返回。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewSummary {
+    pub waiting: ReviewWaiting,
+    pub decided: ReviewDecided,
+    pub health: ReviewHealth,
+    pub agent: ReviewAgent,
+}
+
+/// agent 在这个库里做过什么（0025）：开着的建议，以及近期每一笔现在的状态
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReviewAgent {
+    /// 此刻在跑
+    pub running: bool,
+    /// 还没轮到 agent 看的对
+    pub queue: i64,
+    /// 等人回答的建议，不分时间
+    pub open: i64,
+    pub last_7d: AgentWindow,
+    pub last_30d: AgentWindow,
+}
+
+/// 一个时间窗口里 agent 写下的行，按**现在的**状态数：自动裁了还站着的、
+/// 人接受的、人改判的、人撤回的
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AgentWindow {
+    pub applied: i64,
+    pub proposed: i64,
+    pub accepted: i64,
+    pub overridden: i64,
+    pub reverted: i64,
+}
+
+/// 一档队列里等着的：多少条、最老的一条从什么时候开始等
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct QueueWait {
+    pub count: i64,
+    pub oldest_at: Option<DateTime<Utc>>,
+}
+
+/// 七档队列，与 [`ReviewCounts`] 同一套口径（同一套 WHERE），多了「最老」
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReviewWaiting {
+    pub pending: QueueWait,
+    pub duplicates: QueueWait,
+    pub conflicts: QueueWait,
+    pub unconfirmed: QueueWait,
+    pub lowconf: QueueWait,
+    pub violations: QueueWait,
+    pub defects: QueueWait,
+    pub alignment: QueueWait,
+    pub errata: QueueWait,
+}
+
+/// 办过的：近 7 天与近 30 天两个窗口，加近 14 天每天一根柱
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDecided {
+    pub last_7d: DecidedWindow,
+    pub last_30d: DecidedWindow,
+    /// 近 14 天，按天，一天一条，没有决定的那天也在（count 0）——画柱子要等距
+    pub daily: Vec<DecidedDay>,
+}
+
+/// 一个时间窗口里的决定：总数、其中 AI 自裁的（台账上没有 actor 的那些）、
+/// 按动作分、按人分
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DecidedWindow {
+    pub total: i64,
+    pub automatic: i64,
+    pub by_action: Vec<ActionCount>,
+    pub by_actor: Vec<ActorCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionCount {
+    /// 台账上的动作名（review.merge / fact.confirm / conflict.close_old …）
+    pub action: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActorCount {
+    /// None = 后台自裁（攒批裁决那种没有客户端、没有人的动作）
+    pub actor_id: Option<Uuid>,
+    /// 台账里的身份快照；人被删了也认得出
+    pub label: Option<String>,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecidedDay {
+    pub day: chrono::NaiveDate,
+    pub count: i64,
+}
+
+/// 库的成色：还在世的事实里有多少是暂定的——低置信、证据全被换掉了、
+/// 正跟别的事实打架
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReviewHealth {
+    pub facts: i64,
+    pub low_confidence: i64,
+    pub unconfirmed: i64,
+    pub contested: i64,
 }
 
 /// 一个关系声明了哪些 OWL 公理。
@@ -970,16 +1689,21 @@ pub struct RelationAxioms {
 
 /// 文库的一页，连同这一页之外的统计。
 ///
-/// **统计不受名字/状态筛选影响**：`ready` / `extracting` / `failed` 说的是这个
-/// 来源里有多少，那是批量按钮的作用范围，跟你此刻在搜什么无关。
+/// **统计不受名字/状态筛选影响**：`ready` / `done` / `extracting` / `failed` 说的是
+/// 这个来源里有多少，那是批量按钮的作用范围，跟你此刻在搜什么无关。
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentPage {
     pub docs: Vec<Document>,
     /// 命中筛选的总数（分页器用它）
     pub total: i64,
+    /// 摄入完成（`status = 'ready'`）的篇数：重抽的作用范围
     pub ready: i64,
+    /// 抽取完成（`graph_status = 'done'`）的篇数：抽取进度条的分子
+    pub done: i64,
     pub extracting: i64,
     pub failed: i64,
+    /// 整库的墓碑数（删了、没清的）——左栏「已删除」那一行的数字，不随作用域变
+    pub deleted: i64,
 }
 
 /// 一枚个人访问令牌的元信息（0014）。**永远不含明文**——

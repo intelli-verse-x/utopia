@@ -102,6 +102,16 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Discard an incomplete rebuild while retaining the index's writer lock.
+    /// Removing its directory first could erase another process's live index.
+    pub fn clear(&self) -> anyhow::Result<()> {
+        let mut writer = self.writer.lock().expect("writer 锁中毒");
+        writer.delete_all_documents()?;
+        writer.commit()?;
+        self.reader.reload()?;
+        Ok(())
+    }
+
     pub fn delete_document(&self, document_id: &str) -> anyhow::Result<()> {
         let mut writer = self.writer.lock().expect("writer 锁中毒");
         writer.delete_term(Term::from_field_text(self.f_document_id, document_id));
@@ -180,6 +190,77 @@ pub fn rrf_fuse(lists: &[Vec<String>], limit: usize) -> Vec<String> {
         }
     }
     let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 同分按 id 定序，否则 HashMap 的随机顺序会改变上限内保留的证据和口径。
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     ranked.into_iter().take(limit).map(|(id, _)| id).collect()
+}
+
+#[cfg(test)]
+mod rrf_tests {
+    use super::rrf_fuse;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 一路召回就是那一路的顺序，融合不许重排
+    #[test]
+    fn one_list_comes_back_in_its_own_order() {
+        let lists = vec![ids(&["a", "b", "c"])];
+        assert_eq!(rrf_fuse(&lists, 10), ids(&["a", "b", "c"]));
+    }
+
+    /// 两路都点名的排最前；只在一路里的按各自名次的倒数相加比大小：
+    /// a = 1/61 + 1/62，c = 1/63 + 1/61，b = 1/62
+    #[test]
+    fn two_lists_follow_the_reciprocal_rank_arithmetic() {
+        let lists = vec![ids(&["a", "b", "c"]), ids(&["c", "a"])];
+        assert_eq!(rrf_fuse(&lists, 10), ids(&["a", "c", "b"]));
+    }
+
+    /// 空的那一路不是失败的那一路：它什么分都不加，也不影响别人
+    #[test]
+    fn an_empty_list_contributes_nothing() {
+        let lists = vec![ids(&["a", "b"]), Vec::new()];
+        assert_eq!(rrf_fuse(&lists, 10), ids(&["a", "b"]));
+    }
+
+    /// 上限在融合之后裁，不是每路各裁
+    #[test]
+    fn the_limit_cuts_after_fusion() {
+        let lists = vec![ids(&["a", "b"]), ids(&["b", "c"])];
+        assert_eq!(rrf_fuse(&lists, 1), ids(&["b"]));
+    }
+
+    #[test]
+    fn equal_scores_keep_the_same_candidates_at_every_limit() {
+        let mut lists = vec![ids(&["z", "b"]), ids(&["y", "a"])];
+        let expected = ids(&["y", "z", "a", "b"]);
+        // Each call builds a newly seeded HashMap. Both channel heads must
+        // precede their runners-up, and a cutoff through either tie is stable.
+        for _ in 0..32 {
+            for limit in 0..=expected.len() + 1 {
+                assert_eq!(
+                    rrf_fuse(&lists, limit),
+                    expected[..limit.min(expected.len())]
+                );
+            }
+            lists.reverse();
+        }
+    }
+
+    #[test]
+    fn equal_scores_from_opposite_ranks_are_ordered_by_id() {
+        let lists = vec![ids(&["c", "a", "b"]), ids(&["b", "a", "c"])];
+        // b and c each score 1/61 + 1/63, above a's 2/62. Equal totals
+        // must not acquire a preference for whichever channel came first.
+        for _ in 0..32 {
+            assert_eq!(rrf_fuse(&lists, 3), ids(&["b", "c", "a"]));
+            assert_eq!(rrf_fuse(&lists, 1), ids(&["b"]));
+        }
+    }
 }

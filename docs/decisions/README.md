@@ -1,57 +1,166 @@
-# 决策记录
+# Decision records
 
-代码记录了**做成什么样**，git 记录了**什么时候改的**。两者都不记录**为什么这样而不是那样**，以及**哪些路走过发现是死路**。这个目录记那个。
+The current design, condensed per domain, is in [../design/](../design/README.md); this directory holds the reasons behind it.
 
-判断标准：如果半年后有人（包括我们自己）看着某段代码问"当初为什么不直接……"，而答案不在代码里，那就该有一篇。
+Code records what was built and git records when it changed. Neither records why it was built this way and which roads turned out to be dead ends. This directory does.
 
-## 约定
+The test for writing one: if someone (including us) looks at a piece of code in six months and asks "why not simply…", and the answer is not in the code, there should be a record.
 
-**文件名** `NNNN-短横线英文标题.md`，四位序号，按创建顺序递增，不留空号。序号只是稳定的引用锚点，不表示优先级。
+## Conventions
 
-**目录扁平**。在出现第二种性质不同的文档之前，不建子目录。
+**File names** are `NNNN-short-english-title.md`, four digits, increasing in creation order, no gaps. The number is a stable anchor for references and says nothing about priority.
 
-**修订就地留痕，不静默改写**。结论变了——尤其是因为查证推翻了原判断——**在原处保留「修订记录」块**写清：原本是什么、为什么错、依据什么改的。不要把错误的那版删干净。
+**The directory is flat.** No subdirectories until a second kind of document appears.
 
-> 这条不是文档洁癖，是同一条产品原则。我们的账本从不原地 UPDATE 事实，纠正是插入新行 + `supersedes` 旧行，因为**认知变更本身是信息**。决策记录同理：知道"我们曾经以为 range 能立刻生效，查完发现一条都没有"，比只看到最终结论有用得多——它告诉你下次该先查什么。
+**Revisions stay in place.** When a conclusion changes, especially because checking the code overturned it, keep a dated revision note where the original claim stood: what it said, why it was wrong, what changed it. The ledger this product keeps never updates a fact in place; a correction inserts a new row that supersedes the old one, because the change of mind is information. Records follow the same rule: knowing "we assumed a range would take effect immediately, checked, and found it never did" tells the next reader what to check first.
 
-**结论变得太多时**，另起一篇并在旧篇顶部标 `已被 NNNN 取代`，而不是把旧篇改成新的。
+**When too much has changed**, write a new record and mark the old one `superseded by NNNN` at the top instead of rewriting it.
 
-**状态行由实现它的 PR 负责更新。** 0011、0014、0015 三篇的状态行曾落后于同一个 PR 里的代码——写记录的人和写代码的人是同一个人、同一个提交，仍然漏了。所以 PR 描述里要答一句：这个改动实现或推翻了哪篇决策记录，状态行改了没有。（2026-09-02 加，出处见 [0016](0016-close-the-open-seams-before-cutting-new-ones.md)。）
+**The PR that implements a record updates its status line.** Three status lines once lagged behind the code in the same PR, written by the same person. So the PR description answers one question: which record does this change implement or overturn, and is its status line updated. (Added 2026-09-02, from [0016](0016-close-the-open-seams-before-cutting-new-ones.md).)
 
-**行号会漂，文件名会换。** 正文里的 `file.rs:123` 是成文时的坐标，不保证仍然准确；迁移在 #130 / #131 从 53 份折成 10 份、一个域一份，所以 2026-08-31 之前写的迁移文件名都要按域重找。引用时优先写函数名、表名、常量名。
+**A status line is one line.** It starts with one of five words, `Proposed`, `Accepted`, `In progress`, `Implemented` or `Superseded by NNNN`, then the date and the PR or migration, then `open:` and what is not built. What a cut contains belongs in the record's body or in the design file, not in the status line. The index below repeats only the first word, so a PR touches this README only when that word changes. (Added 2026-09-27; the longer lines that stood before are kept at the end of each record under Status history.)
 
-**语言**：中文，与代码注释一致（UI 与 README 保持英文）。目前的读者是维护者，不是外部贡献者；将来需要时再译。
+**Line numbers drift and file names change.** Prefer function, table and constant names over `file.rs:123`. Migrations were consolidated from 53 files into one per domain (#130, #131); older references to migration files are by domain.
 
-## 索引
+**Language: English.** The first sixteen records were written in Chinese and condensed into English on 2026-09-03; the Chinese originals remain in git history. Code comments are still Chinese; UI, README and records are English.
 
-| | 文档 | 状态 |
-|---|---|---|
-| 0001 | [本体导入与治理路线](0001-ontology-import-and-governance.md) | 进行中 · P0–P2c 全建成；P3 按预算落地、P3a 只能手动跑；P3b 建成但形态不同；**P4b/P4c 待做**；P5 已由 0002 落地；判据 2 被 0012 推翻一半 |
-| 0002 | [推理机](0002-reasoning-engine.md) | R0 建成（含本体自检八类）· R1 建成带开关默认关 · **R2 只一层、R3 未做** · 派生 vs 断言矛盾无信号 |
-| 0003 | [本体从语料里长出来，人站在哪一环](0003-ontology-growth-loop.md) | 已建成且仍在跑 · 起点已被 0010 与种子退场改写 · 「拒绝有记忆」被 0007 推翻重做 · 新说法提醒待做 |
-| 0004 | [语言：哪些字跟着看的人走，哪些跟着语料走](0004-language-and-localization.md) | 已建成 · L0–L3 全落地 · 界面刻意不猜浏览器语言 · 「中文内置本体」随播种退场作废 |
-| 0005 | [告警中心](0005-alert-center.md) | 已建成 · 五种告警 · 三个决定推翻两个（就地留痕）· `no_text_layer` 待接 |
-| 0006 | [本体规模与抽取提示词](0006-ontology-scale-and-the-prompt.md) | 已建成 · 「内置类恒在」换成祖先补齐 · 预算与候选数仍待测 · 外部答案键未做 |
-| 0007 | [谁来决定一个说法值不值得成为关系](0007-who-decides-what-becomes-a-relation.md) | 已建成 · 六条缺陷全修 · 起点（种子、`related_to`）已不存在 · `_by` 折叠与叙述动词待解 |
-| 0008 | [预制本体包作为冷启动](0008-ontology-packs-as-cold-start.md) | 已建成 · 五包内嵌、多选、对齐表 22 条 · 三个开放问题全开，中文标签变严重 |
-| 0009 | [「还没判出来」不该是一个类](0009-no-type-is-a-type.md) | 已实施 · `disjointWith` 落库但消解侧未消费 · `metric`/`dimension` 去处未答且有可见代价 |
-| 0010 | [「说不出是什么关系」不该是一个关系](0010-no-relation-is-no-relation.md) | 已实施 · 待做两条随 0011 完成 · 两处死代码待清 |
-| 0011 | [「怎么算」不是「有什么」](0011-a-mapping-is-not-a-fact.md) | 已实施（#126 / #140 / #148）· 证据链未做 · 多源选法未做 |
-| 0012 | [本体是一份契约，不只是一份建议](0012-the-ontology-is-a-contract-not-a-suggestion.md) | 已实施 · 违反率 57%→4%、反向 39→0 · 三条待做全未做 |
-| 0013 | [一个来源该交出它的历史，不是它的现状](0013-a-source-should-hand-over-its-history.md) | 已实施两个（GitHub / Jira）· 文档协作类未开工 |
-| 0014 | [身份跟着人，范围跟着令牌](0014-identity-from-the-person-scope-from-the-token.md) | 已实施（#180）· MCP 只读五工具 · **没有令牌界面** · 误导性的占位 crate 已删 |
-| 0015 | [记下一句话，不等于断言一个事实](0015-recording-a-sentence-is-not-asserting-a-fact.md) | 进行中 · schema 已落、**运行时零接线** · `remember` 整体停用作临时闸 |
-| 0016 | [先把开着的口子收上，再开新的](0016-close-the-open-seams-before-cutting-new-ones.md) | 规划中 · v0.1.0 之后的排期：A 收口 → B 推理机 ∥ C 尺子与本体 → D 语义层 → E 企业交付；模拟引擎后置 |
+## Index
 
-## 不是决策记录的那些
+By domain; the domains are the files of [../design/](../design/README.md). **Status** is the first word of the record's own status line. **Overtaken** says whether a later record overturned it: `partly (by NNNN)` means some decisions fell and the record's revision notes say which. Open work: `grep 'open:' docs/decisions/0*.md`.
 
-**[../pipeline.md](../pipeline.md) —— 一份文档如何变成图谱。** 决策记录讲「为什么这样
-而不是那样」；那一篇讲「东西怎么流的、在哪一步会被丢掉」，带五张 mermaid 图（2026-09-02 加了公理那一张）。
-新来的人先看它，再回来看这里的理由。
+### [ontology](../design/ontology.md)
 
-这是本目录约定里说的「第二种性质不同的文档」。它没进子目录——放在 `docs/` 根上，
-`.gitignore` 里单独开口，跟 `decisions/` 并列。
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0001 | [Ontology import and governance](0001-ontology-import-and-governance.md) | In progress | partly (by 0009, 0010, 0012, 0044) |
+| 0003 | [The ontology grows out of the corpus](0003-ontology-growth-loop.md) | Implemented | partly (by 0007, 0010, 0044) |
+| 0007 | [Counting decides what becomes a relation](0007-who-decides-what-becomes-a-relation.md) | Implemented | partly (by 0044) |
+| 0008 | [Ontology packs as the cold start](0008-ontology-packs-as-cold-start.md) | Implemented |  |
+| 0009 | [An undecided type stays empty](0009-no-type-is-a-type.md) | Implemented |  |
+| 0012 | [The ontology is a contract](0012-the-ontology-is-a-contract-not-a-suggestion.md) | Implemented | partly (by 0044) |
+| 0044 | [The ontology is a view over what documents say](0044-the-ontology-is-a-view-over-what-documents-say.md) | In progress |  |
+| 0051 | [A human phrase decision carries its materialization work](0051-a-human-phrase-decision-carries-its-materialization-work.md) | Implemented |  |
+| 0053 | [A phrase decision records the inputs it considered](0053-a-phrase-decision-records-the-inputs-it-considered.md) | Implemented |  |
+| 0061 | [The ontology is proposed from the open graph and judged by its questions](0061-the-ontology-is-proposed-from-the-open-graph-and-judged-by-its-questions.md) | In progress |  |
+| 0062 | [The export says what is contested](0062-the-export-says-what-is-contested.md) | Implemented |  |
 
-## 不放这里的东西
+### [extraction](../design/extraction.md)
 
-`docs/` 根目录是**本地草稿区**（`.gitignore` 里 `/docs/*` 忽略，只对 `/docs/decisions/` 开口）。随手的调研笔记、临时清单、跑测试的中间产物放那儿，不入库。等某份草稿沉淀出了值得留的判断，再作为一篇决策记录搬进来。
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0006 | [Ontology scale and the extraction prompt](0006-ontology-scale-and-the-prompt.md) | Superseded | fully (by 0044) |
+
+### [identity](../design/identity.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0041 | [A name is a claim about an entity](0041-a-name-is-a-claim-about-an-entity.md) | In progress |  |
+| 0071 | [A source may declare its names identities](0071-a-source-may-declare-its-names-identities.md) | Proposed |  |
+
+### [time](../design/time.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0019 | [The second clock can be rewound](0019-the-second-clock-can-be-rewound.md) | Implemented |  |
+| 0022 | [An unknown date is not an open one](0022-an-unknown-date-is-not-an-open-one.md) | Implemented | partly (by 0045) |
+| 0024 | [The world axis reaches the second](0024-the-world-axis-reaches-the-second.md) | Implemented |  |
+| 0031 | [An event holds at the moment it names](0031-an-event-holds-at-the-moment-it-names.md) | Implemented |  |
+| 0045 | [A time mention is resolved against its document](0045-a-time-mention-is-resolved-against-its-document.md) | In progress |  |
+
+### [ledger](../design/ledger.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0010 | [An unnamed relation stays empty](0010-no-relation-is-no-relation.md) | Implemented | partly (by 0044) |
+| 0037 | [A relation carries its own attributes](0037-a-relation-carries-its-own-attributes.md) | In progress | partly (by 0044) |
+| 0048 | [Provenance references stay inside the knowledge base](0048-provenance-references-stay-inside-the-knowledge-base.md) | Implemented |  |
+| 0070 | [A role word speaks while its chunk is live](0070-a-role-word-speaks-while-its-chunk-is-live.md) | Proposed |  |
+
+### [governance](../design/governance.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0015 | [A recorded sentence waits for a nod](0015-recording-a-sentence-is-not-asserting-a-fact.md) | Implemented |  |
+| 0017 | [A contradiction points at an error upstream](0017-a-contradiction-points-upstream.md) | Implemented |  |
+| 0025 | [Governance reads the ledger before it decides](0025-governance-reads-the-ledger-before-it-decides.md) | Implemented |  |
+| 0026 | [A decision records why](0026-a-decision-records-why.md) | Implemented |  |
+| 0027 | [An automatic merge is gated by what it can undo](0027-an-automatic-merge-is-gated-by-what-it-can-undo.md) | Implemented |  |
+| 0028 | [The adjudicator looks before it asks](0028-the-adjudicator-looks-before-it-asks.md) | Implemented |  |
+| 0043 | [Every review queue is governed](0043-every-review-queue-is-governed.md) | Accepted |  |
+
+### [rules](../design/rules.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0002 | [Reasoning engine](0002-reasoning-engine.md) | In progress |  |
+| 0021 | [A rule reads attributes and concludes a type](0021-a-rule-reads-attributes-and-concludes-a-type.md) | Implemented |  |
+| 0029 | [A rule may say "or", once](0029-a-rule-may-say-or-once.md) | Implemented |  |
+| 0030 | [A rule may read what a rule concluded](0030-a-rule-may-read-what-a-rule-concluded.md) | In progress |  |
+| 0032 | [A rule computes what it concludes](0032-a-rule-computes-what-it-concludes.md) | In progress |  |
+| 0047 | [A rule may conclude a relation](0047-a-rule-may-conclude-a-relation.md) | Implemented |  |
+| 0049 | [Expression declarations are checked when a rule is written](0049-expression-declarations-are-checked-when-a-rule-is-written.md) | Proposed |  |
+| 0060 | [A rule's definition has a history](0060-a-rule-definition-has-a-history.md) | Implemented |  |
+
+### [sources](../design/sources.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0013 | [A source hands over its history](0013-a-source-should-hand-over-its-history.md) | Implemented |  |
+| 0023 | [RSS observations are not documents](0023-rss-observations-are-not-documents.md) | Implemented |  |
+| 0033 | [RSS summaries are scoped to the source being listed](0033-rss-source-summaries-are-source-scoped.md) | Implemented |  |
+| 0035 | [A vector index is built by a job](0035-a-vector-index-is-built-by-a-job.md) | Implemented |  |
+| 0039 | [A chunk is what extraction sees](0039-a-chunk-is-what-extraction-sees.md) | In progress |  |
+| 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | Implemented |  |
+| 0052 | [Document content is a read contract over the retained ledger](0052-document-content-is-a-read-contract.md) | Proposed |  |
+| 0054 | [A source may push statements in the open contract](0054-a-source-may-push-statements-in-the-open-contract.md) | Implemented |  |
+| 0065 | [The OCR reader chooses its provider](0065-readers-choose-their-provider.md) | Implemented |  |
+
+### [lakehouse-and-actions](../design/lakehouse-and-actions.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0011 | [A mapping is configuration](0011-a-mapping-is-not-a-fact.md) | Implemented | partly (by 0036, 0044) |
+| 0018 | [The lakehouse is one protocol away](0018-the-lakehouse-is-one-protocol-away.md) | Implemented |  |
+| 0034 | [An action is a declared call](0034-an-action-is-a-declared-call.md) | Proposed |  |
+| 0036 | [Exploration aligns a schema to the ontology](0036-exploration-aligns-a-schema-to-the-ontology.md) | In progress |  |
+| 0050 | [An action attempt keeps its identity and uncertain outcome](0050-an-action-attempt-keeps-its-identity-and-uncertain-outcome.md) | Proposed |  |
+
+### [access-and-audit](../design/access-and-audit.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0014 | [Identity from the person, scope from the token](0014-identity-from-the-person-scope-from-the-token.md) | Implemented |  |
+| 0020 | [An auditor reads it without us](0020-an-auditor-reads-it-without-us.md) | Implemented |  |
+| 0066 | [Another app may trade a fresh ID token for a session](0066-another-app-may-trade-a-fresh-id-token-for-a-session.md) | Implemented | partly (by 0069) |
+| 0069 | [The identity provider vouches for listed domains](0069-the-identity-provider-vouches-for-listed-domains.md) | Implemented |  |
+
+### [interface](../design/interface.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0004 | [Language follows the reader of each text](0004-language-and-localization.md) | Implemented | partly (by 0044) |
+| 0005 | [The alert center](0005-alert-center.md) | Implemented |  |
+| 0038 | [The interface has a light side](0038-the-interface-has-a-light-side.md) | Implemented |  |
+
+### [chat-and-mcp](../design/chat-and-mcp.md)
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0042 | [The chat loop is a runner with hooks](0042-the-chat-loop-is-a-runner-with-hooks.md) | Implemented |  |
+| 0046 | [The app surface is MCP](0046-the-app-surface-is-mcp.md) | Accepted |  |
+| 0063 | [Stopping a chat ends the generation](0063-stopping-a-chat-ends-the-generation.md) | Implemented |  |
+| 0064 | [Extraction reads time as it goes](0064-extraction-reads-time-as-it-goes.md) | In progress |  |
+
+### process
+
+| | Record | Status | Overtaken |
+|---|---|---|---|
+| 0016 | [Close the open seams before cutting new ones](0016-close-the-open-seams-before-cutting-new-ones.md) | In progress | partly (by 0036) |
+
+## Not a decision record
+
+**[../pipeline.md](../pipeline.md), how a document becomes a graph.** Records explain why; that page explains how things flow and where they get dropped, with five mermaid diagrams. Newcomers read it first, then come back here for the reasons. It is the "second kind of document" the conventions mention, kept at the `docs/` root beside `decisions/`.
+
+## What does not belong here
+
+The `docs/` root is a local scratch area (`/docs/*` is git-ignored except `/docs/decisions/`, `/docs/design/` and `/docs/pipeline.md`). Research notes, temporary checklists and test output live there and stay out of the repository. When a draft settles into a judgment worth keeping, it moves here as a record.

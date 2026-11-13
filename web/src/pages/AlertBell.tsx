@@ -5,96 +5,182 @@
 //
 // 一条告警 = 一次故障，写完不再变，没有"已解决"。
 // 「已读」逐人——一个人读过不代表别人也该从未读里消失。
-import { type Ref, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Bell, Search, X } from "lucide-react";
+import { Bell } from "lucide-react";
 
 import { api, type AlertGroup } from "../api";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { S } from "../i18n";
-import { Chip, Pager, cn } from "../ui";
-import { usePopoverFlip } from "../ui/popoverFlip";
+import { toast } from "../toast";
+import {
+  Button,
+  Chip,
+  type ChipTone,
+  cn,
+  IconButton,
+  Input,
+  LinkButton,
+  Pager,
+  localDateTime,} from "../ui";
 
 const PAGE = 8;
 
-/** 明细里给人看的那一行：对象名 — 报错原文 */
+/** 明细里给人看的那一行：对象名 — 报错原文或截断范围 */
 function line(d: AlertGroup["lines"][number]): string | null {
-  const parts = [d.name ?? d.job, d.error].filter(Boolean);
+  const partial = d.warnings?.flatMap((warning) => {
+    const anchor = warning.detail;
+    if (
+      warning.kind === "spreadsheet.rows_truncated" &&
+      typeof anchor?.sheet === "string" &&
+      typeof anchor.rows_read === "number" &&
+      typeof anchor.rows_total === "number"
+    ) {
+      return [S.alerts.partialRows(anchor.sheet, anchor.rows_read, anchor.rows_total)];
+    }
+    if (
+      warning.kind === "csv.records_truncated" &&
+      typeof anchor?.records_read === "number" &&
+      typeof anchor.records_total === "number"
+    ) {
+      return [S.alerts.partialRecords(anchor.records_read, anchor.records_total)];
+    }
+    return [];
+  });
+  const parts = [d.name ?? d.job, d.error, ...(partial ?? [])].filter(Boolean);
   return parts.length ? parts.join(" — ") : null;
 }
+
+/** 哪些告警带「再跑一遍」：故障修好之后（充值、改端点）任务不会自己回来的那几种 */
+const REQUEUE_KINDS = new Set(["llm.out_of_credit", "llm.unreachable"]);
+
+/* 轻重是服务端定的（`utopia-store/src/alerts.rs` 的 severity），一组取组里最重的
+   那一档。**告警不全是故障**：欠费、源同步失败是 error，限流、schema 没摄进来、
+   治理跳闸是 warning，而「映射探索一条口径都没提出来」是 info——它是"你等的那件
+   事没有结果"，不是坏了。从前这一栏一概不看 severity，七种告警长得一模一样。 */
+const SEVERITY_TONE: Record<string, ChipTone> = {
+  error: "danger",
+  warning: "warn",
+  info: "info",
+};
 
 function AlertRow({
   g,
   onRead,
+  onRequeue,
+  requeuing,
 }: {
   g: AlertGroup;
   onRead: (g: AlertGroup) => void;
+  onRequeue: (g: AlertGroup) => void;
+  requeuing: boolean;
 }) {
   // 没见过的 kind 也得显示得出来：新告警源上线时前端可能还没跟上，
   // 而"有条告警但我不认识它"远好过"什么都不显示"
   const worded = S.alerts.kinds[g.kind];
   const lines = g.lines.map(line).filter((l): l is string => !!l);
+  /* 同一句报错重复五遍，读者第二遍就不再读了，可它照样把面板撑高一截：
+     一模一样的行并成一条，右边记个次数。**并的是显示，不是计数**——
+     下面「还有 N 条」用的仍是原始条数 */
+  const tally = new Map<string, number>();
+  for (const l of lines) tally.set(l, (tally.get(l) ?? 0) + 1);
   // count 数的是整组，lines 只带回前几条——差额是"还有 N 条"
   const rest = g.count - lines.length;
   return (
-    <button
-      type="button"
+    // div 而不是 button：行里还有一个动作按钮，按钮套按钮是无效 HTML
+    <div
+      role="button"
+      tabIndex={0}
       // **点击才算读过**，不是划过。鼠标经过一列告警不代表看过它们，
       // 而已读一旦落下就再也不会自己回来。点一下把这一组整个标掉
       onClick={() => {
         if (g.unread > 0) onRead(g);
       }}
-      className="w-full text-left flex gap-2.5 px-3.5 py-3 border-b border-white/[0.06] last:border-b-0 hover:bg-white/[0.03] transition-colors"
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && g.unread > 0) onRead(g);
+      }}
+      className={cn(
+        "u-row-shell relative w-full cursor-pointer border-b border-line px-4 py-3 text-left last:border-b-0",
+        // 读过的整条退一档：标题、库名、时间、明细一起暗下去，扫一眼就知道
+        // 哪几条还没看。悬停照常
+        g.unread === 0 && "opacity-65",
+      )}
     >
-      {/* 未读就是一个红点。整行描边或底色会让面板在告警多时变成一片红，
-          而红点只占它该占的那一点地方，读过就没了 */}
-      <span
-        className={cn(
-          "mt-[7px] h-1.5 w-1.5 rounded-full shrink-0",
-          g.unread > 0 ? "bg-rose-500" : "bg-transparent",
-        )}
-      />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5 flex-wrap">
+      {/* **读没读过靠整条的明暗，不靠一个点。**从前未读是左边一颗色点，它只能
+          塞进内距里（排进文字那一列的话，正文会比面板标题和查找框往右缩 18px，
+          一张面板三种左缘），结果是紧贴着左边框，看着像掉在外面。
+          现在未读的标题是正文色加中等字重，读过的整条退到次级色——一眼扫下去，
+          亮的是还没看的。严重程度由右边那个计数 chip 的颜色说，不必再来一个点。 */}
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
           <span
             className={cn(
-              "text-[13px]",
-              g.unread > 0 ? "font-medium text-white" : "text-neutral-400",
+              "min-w-0 flex-1 text-body",
+              g.unread > 0 ? "font-medium text-ink" : "text-ink-2",
             )}
           >
             {worded?.title ?? S.alerts.unknownKind(g.kind)}
           </span>
-          {g.count > 1 && <Chip tone="neutral">{g.count}</Chip>}
+          {/* 次数是"这件事发生了几回"，不是一句补充说明：中性灰把它读成一个
+              标签，而它说的是这条告警的分量 */}
+          {g.count > 1 && (
+            <Chip tone={SEVERITY_TONE[g.severity] ?? "neutral"}>{g.count}</Chip>
+          )}
+        </div>
+        {/* 哪个库、什么时候：落款单独一行。跟在标题后面的话，标题一长就把
+            它们挤到下一行，每条告警的头两行长得都不一样 */}
+        <div className="mt-1 flex items-center gap-2">
           <Chip tone={g.kb_name ? "neutral" : "violet"}>
             {g.kb_name ?? S.alerts.system}
           </Chip>
+          {/* 取组里最新的那一次 */}
+          <span className="u-num ml-auto shrink-0 text-fine text-ink-2">
+            {localDateTime(g.latest_at)}
+          </span>
         </div>
         {worded && (
-          <p className="mt-0.5 text-[11.5px] text-neutral-500">{worded.hint}</p>
+          <p className="mt-1 text-small text-ink-2">{worded.hint}</p>
         )}
         {lines.length > 0 && (
-          <ul className="mt-1 space-y-0.5">
-            {lines.map((l, i) => (
-              <li key={i} className="text-[11px] text-neutral-400 break-words">
+          <ul className="mt-1 space-y-1">
+            {[...tally].map(([l, n]) => (
+              <li key={l} className="text-fine text-ink-2 break-words">
                 {l}
+                {n > 1 && <span className="u-num text-ink-2"> ×{n}</span>}
               </li>
             ))}
             {rest > 0 && (
-              <li className="text-[11px] text-neutral-600">
+              <li className="text-fine text-ink-2">
                 {S.alerts.andMore(rest)}
               </li>
             )}
           </ul>
         )}
-        {/* 时间取组里最新的那一次 */}
-        <p className="u-num mt-1.5 text-[10.5px] text-neutral-600">
-          {new Date(g.latest_at).toLocaleString()}
-        </p>
+        {/* 修好之后接着跑：把这次故障窗口里失败的任务放回队列（#216）。
+            余额耗尽是唯一一种「人做完一件具体的事就想让活继续」的失败，
+            动作长在告警上，闭环就在这里，不必另建一个队列页 */}
+        {REQUEUE_KINDS.has(g.kind) && (
+          <Button variant="secondary" size="sm" className="mt-2"
+            type="button"
+            disabled={requeuing}
+            onClick={(e) => {
+              e.stopPropagation();
+              onRequeue(g);
+            }}
+          >
+            {S.alerts.runAgain}
+          </Button>
+        )}
       </div>
-    </button>
+    </div>
   );
 }
 
-function Panel({ panelRef }: { panelRef: Ref<HTMLDivElement> }) {
+function Panel() {
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
   const qc = useQueryClient();
@@ -126,55 +212,52 @@ function Panel({ panelRef }: { panelRef: Ref<HTMLDivElement> }) {
     mutationFn: () => api.alertsReadAll(),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["alerts"] }),
   });
+  // 时间窗从这组最早那次故障起——之前失败的不是这次的事
+  const requeue = useMutation({
+    mutationFn: (g: AlertGroup) =>
+      api.requeueJobs(g.kb_id, { failed_since: g.earliest_at }),
+    onSuccess: (r) => {
+      toast.success(S.alerts.requeued(r.requeued));
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    },
+    onError: (e) => toast.error(String(e)),
+  });
 
   const groups = list.data?.items ?? [];
   const total = list.data?.total ?? 0;
 
   return (
-    // top-0 而不是 top-9：面板要从铃铛**原位**长出来，右上角对齐
-    <div
-      ref={panelRef}
-      className="u-menu-glass absolute right-0 top-0 w-[420px] rounded-xl shadow-2xl z-50 overflow-hidden"
-    >
-      <div className="flex items-center gap-2 pl-3.5 pr-10 py-2.5 border-b border-white/10">
-        <span className="text-[13px] font-medium text-neutral-100">
+    <>
+      {/* 标题行。**不再兼任关闭键**：从前面板是从铃铛原位长出来的，第一行压着
+          铃铛，点它就缩回去；换成标准弹层之后关闭归 Esc、外点与铃铛本身，
+          这一行只说这是什么 */}
+      <div className="flex items-center gap-3 border-b border-line px-4 py-3">
+        <Bell size={15} strokeWidth={1.8} className="shrink-0 text-ink-2" />
+        <span className="min-w-0 flex-1 truncate text-body font-medium text-ink">
           {S.alerts.title}
         </span>
       </div>
 
-      {/* 跟文库的过滤框同一套：input-dark + 左侧图标 + 有值时右侧清除、Esc 清空 */}
-      <div className="px-3.5 py-2.5 border-b border-white/[0.06]">
-        <div className="relative">
-          <Search
-            size={13}
-            className="absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-500 pointer-events-none"
-          />
-          <input
-            className="input-dark w-full pl-8 pr-7 py-1.5 text-[13px]"
-            placeholder={S.alerts.searchPlaceholder}
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && setQ("")}
-          />
-          {q && (
-            <button
-              onClick={() => setQ("")}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-neutral-200"
-            >
-              <X size={12} />
-            </button>
-          )}
-        </div>
+      {/* 查找与库切换器同一副样子：没有自己的框（bare），它是面板的一段，
+          不是面板里摆的一个控件；Esc 与外点由 Popover 统一管 */}
+      <div className="border-b border-line px-4 py-3">
+        <Input
+          bare
+          className="w-full text-body"
+          placeholder={S.alerts.searchPlaceholder}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
       </div>
 
       <div className="max-h-[420px] overflow-y-auto">
         {groups.length === 0 ? (
-          <div className="px-3.5 py-8 text-center">
-            <p className="text-[13px] text-neutral-300">
+          <div className="px-4 py-8 text-center">
+            <p className="text-body text-ink-2">
               {q ? S.alerts.noMatch : S.alerts.empty}
             </p>
             {!q && (
-              <p className="mt-1 text-[11.5px] text-neutral-500">
+              <p className="mt-1 text-small text-ink-2">
                 {S.alerts.emptyHint}
               </p>
             )}
@@ -185,6 +268,8 @@ function Panel({ panelRef }: { panelRef: Ref<HTMLDivElement> }) {
               key={`${g.kb_id ?? "system"}|${g.kind}|${g.latest_at}`}
               g={g}
               onRead={(x) => read.mutate(x)}
+              onRequeue={(x) => requeue.mutate(x)}
+              requeuing={requeue.isPending}
             />
           ))
         )}
@@ -192,16 +277,15 @@ function Panel({ panelRef }: { panelRef: Ref<HTMLDivElement> }) {
 
       {/* 底栏：整张列表级的动作跟翻页放一起，离光标最远 */}
       {groups.length > 0 && (
-        <div className="flex items-center gap-3 px-3.5 py-2 border-t border-white/[0.06]">
+        <div className="flex items-center gap-3 px-4 py-2 border-t border-line">
           {groups.some((g) => g.unread > 0) && (
-            <button
-              className="text-[11.5px] text-neutral-500 hover:text-neutral-200 transition-colors"
-              onClick={() => readAll.mutate()}
-            >
+            <LinkButton onClick={() => readAll.mutate()}>
               {S.alerts.markAllRead}
-            </button>
+            </LinkButton>
           )}
+          {/* 只有一页也显示：这条底栏是固定的，分页器一藏它就成了一道空边 */}
           <Pager
+            always
             className="ml-auto"
             total={total}
             pageSize={PAGE}
@@ -210,14 +294,12 @@ function Panel({ panelRef }: { panelRef: Ref<HTMLDivElement> }) {
           />
         </div>
       )}
-    </div>
+    </>
   );
 }
 
 export function AlertBell() {
-  // 跟用户菜单同一份原地变形：两个面板紧挨着，动画差一点点来回点两下就看得出来
-  const { open, setOpen, close, rootRef, anchorRef, panelRef } =
-    usePopoverFlip<HTMLButtonElement, HTMLDivElement>();
+  const [open, setOpen] = useState(false);
   const unread = useQuery({
     queryKey: ["alerts", "unread"],
     queryFn: () => api.alertsUnread(),
@@ -227,50 +309,20 @@ export function AlertBell() {
   const n = unread.data?.unread ?? 0;
 
   return (
-    <div ref={rootRef} className="relative">
-      <button
-        ref={anchorRef}
-        onClick={() => (open ? close() : setOpen(true))}
-        title={S.alerts.badgeLabel}
-        aria-label={S.alerts.badgeLabel}
-        aria-expanded={open}
-        // h-7 w-7 正方形：只装一个图标的按钮不该是长方形。
-        // 关闭按钮用同一组尺寸绝对定位在面板的 right-0 top-0，两者严丝合缝
-        className={cn(
-          "relative grid h-7 w-7 place-items-center rounded-lg transition-colors",
-          open
-            ? "text-neutral-200 bg-white/[0.06]"
-            : "text-neutral-500 hover:text-neutral-200 hover:bg-white/[0.05]",
-        )}
-      >
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <IconButton size="md" label={S.alerts.badgeLabel} className="relative">
         <Bell size={15} />
         {/* 角标也是个点，不是数字。"有事没看"是二元的，具体几条打开就知道；
             数字还会随重试一路往上跳，跳到三位数就把铃铛撑变形了 */}
         {n > 0 && (
-          <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-rose-500" />
+          <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-danger" />
         )}
-      </button>
-      {open && (
-        <>
-          <Panel panelRef={panelRef} />
-          {/* 关闭按钮是面板的**兄弟**，不是它的孩子：放里面的话 `right-0 top-0`
-              相对的是面板的内边距盒，而 u-menu-glass 有一条 0.667px 的发丝边框
-              （DPR 1.5 上的一个物理像素），永远差那么一点。放在这里，定位祖先
-              就是裹着铃铛的这个 div，跟铃铛同一个盒子——重合是构造出来的。
-
-              光标点开面板之后正停在这个位置，所以这儿必须是"再点一下关掉"。
-              放"全部标为已读"等于把误触做成默认动作，而它一下清掉的是
-              所有库的所有告警 */}
-          <button
-            onClick={close}
-            title={S.alerts.close}
-            aria-label={S.alerts.close}
-            className="absolute right-0 top-0 z-[60] grid h-7 w-7 place-items-center rounded-lg text-neutral-500 hover:text-neutral-200 transition-colors"
-          >
-            <X size={15} />
-          </button>
-        </>
-      )}
-    </div>
+        </IconButton>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-[420px] overflow-hidden p-0">
+        <Panel />
+      </PopoverContent>
+    </Popover>
   );
 }

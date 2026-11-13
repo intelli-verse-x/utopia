@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use utopia_core::models::DataSourceView;
-use utopia_core::{AppError, AppResult};
+use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
 /// data_sources 的行投影，list 与 mounted 共用。
@@ -18,17 +18,16 @@ type DataSourceRow = (
     Option<bool>,
 );
 
-/// 连接串 → 无凭据摘要（host:port/db）。解析失败给占位符，绝不回显原串。
+/// 连接串 → 无凭据摘要（host[:port]/path）。解析失败给占位符，绝不回显原串。
+/// 端口没写就不补：四种 scheme 的默认端口各不相同，补错比不补更误导
 pub fn conn_summary(conn: &str) -> String {
     url::Url::parse(conn)
         .ok()
         .map(|u| {
             format!(
-                "{}:{}{}",
+                "{}{}{}",
                 u.host_str().unwrap_or("?"),
-                u.port()
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "5432".into()),
+                u.port().map(|p| format!(":{p}")).unwrap_or_default(),
                 u.path()
             )
         })
@@ -40,11 +39,16 @@ pub fn conn_summary(conn: &str) -> String {
 fn row_to_view(
     (id, name, engine, conn, created_at, last_test_at, last_test_ok): DataSourceRow,
 ) -> DataSourceView {
+    // 连接串在库里是封印的；开不了（换过钥匙）就说开不了，别把密文当 URL 去解析
+    let summary = match secrets::open(&conn) {
+        Ok(plain) => conn_summary(&plain),
+        Err(_) => "(sealed with another key)".into(),
+    };
     DataSourceView {
         id,
         name,
         engine,
-        summary: conn_summary(&conn),
+        summary,
         created_at,
         last_test_at,
         last_test_ok,
@@ -77,16 +81,12 @@ pub async fn create(
             "Data source name is required",
         ));
     }
-    if engine != "postgres" {
-        return Err(AppError::invalid(
-            "only_postgres",
-            "Only the postgres engine is supported for now",
-        ));
-    }
-    if !conn_string.starts_with("postgres://") && !conn_string.starts_with("postgresql://") {
+    // 引擎由调用方按连接串的 scheme 定（`query_engine::engine_from_conn`）；
+    // 允许的取值在迁移 0020 的 CHECK 里，这里不再复制一份
+    if engine.is_empty() || conn_string.trim().is_empty() {
         return Err(AppError::invalid(
             "bad_conn_string",
-            "Connection string must start with postgres://",
+            "A connection string is required",
         ));
     }
     let id = Uuid::now_v7();
@@ -97,7 +97,7 @@ pub async fn create(
     .bind(id)
     .bind(name.trim())
     .bind(engine)
-    .bind(conn_string.trim())
+    .bind(secrets::seal(conn_string.trim()))
     .bind(created_by)
     .execute(pool)
     .await?;
@@ -122,7 +122,8 @@ pub async fn conn_string(pool: &PgPool, id: Uuid) -> AppResult<String> {
             .bind(id)
             .fetch_optional(pool)
             .await?;
-    row.map(|(c,)| c).ok_or(AppError::NotFound)
+    let (conn,) = row.ok_or(AppError::NotFound)?;
+    secrets::open(&conn).map_err(AppError::Other)
 }
 
 pub async fn record_test(pool: &PgPool, id: Uuid, ok: bool) -> AppResult<()> {
@@ -179,7 +180,8 @@ pub async fn engine_and_conn(pool: &PgPool, id: Uuid) -> AppResult<(String, Stri
             .bind(id)
             .fetch_optional(pool)
             .await?;
-    row.ok_or(AppError::NotFound)
+    let (engine, conn) = row.ok_or(AppError::NotFound)?;
+    Ok((engine, secrets::open(&conn).map_err(AppError::Other)?))
 }
 
 /// 这个工作区被授权用哪些源（0014）。

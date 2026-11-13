@@ -6,9 +6,14 @@ use utopia_core::models::Role;
 use utopia_core::AppError;
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
+use super::documents_routes::require_reader_kb;
+use crate::auth::{AuthUser, SessionOrToken};
 use crate::error::ApiResult;
 use crate::state::AppState;
+
+#[cfg(test)]
+#[path = "graph_routes_time_tests.rs"]
+mod time_tests;
 
 pub(super) async fn require_kb(
     state: &AppState,
@@ -19,8 +24,15 @@ pub(super) async fn require_kb(
     utopia_store::access::require_kb(&state.pool, user, kb_id, min).await
 }
 
-/// `at`：可选 as-of 日期（YYYY-MM-DD 或 RFC3339）——服务端时间旅行。
-fn parse_at(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
+/// 时刻参数（YYYY-MM-DD 或 RFC3339）——服务端时间旅行。
+///
+/// 两根轴共用这一个解析：`at` 走世界轴（那时世界是什么样），`as_of` 走记录轴
+/// （那时我们以为世界是什么样）。**两个参数一路分开**（0019）：合成一个控件，
+/// 答出来的是另一个问题，而屏幕上看不出来
+pub(super) fn parse_instant(
+    field: &str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -29,7 +41,11 @@ fn parse_at(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, 
     }
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|t| Some(t.with_timezone(&chrono::Utc)))
-        .map_err(|_| AppError::Validation("Invalid `at` (expected YYYY-MM-DD or RFC3339)".into()))
+        .map_err(|_| {
+            AppError::Validation(format!(
+                "Invalid `{field}` (expected YYYY-MM-DD or RFC3339)"
+            ))
+        })
 }
 
 /// 总览一次画多少个节点的**默认值**。上限本身是合理的——画一万个点没人看得懂；
@@ -44,6 +60,9 @@ const GRAPH_NODE_CAP_MAX: i64 = 1000;
 pub struct OverviewQuery {
     #[serde(default)]
     pub at: Option<String>,
+    /// 记录轴：那时**我们持有**的图（0019）。不给就是现在
+    #[serde(default)]
+    pub as_of: Option<String>,
     /// 画多少个。不给就用默认值；给了也钳在 [10, GRAPH_NODE_CAP_MAX]——
     /// 界面上的按钮只给几档，但接口是公开的，别让一个 `limit=999999` 把库拖垮
     #[serde(default)]
@@ -52,12 +71,13 @@ pub struct OverviewQuery {
 
 pub async fn overview(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path(kb_id): Path<Uuid>,
     Query(q): Query<OverviewQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Viewer).await?;
-    let at = parse_at(q.at.as_deref())?;
+    require_reader_kb(&state, &reader, kb_id).await?;
+    let at = parse_instant("at", q.at.as_deref())?;
+    let as_of = parse_instant("as_of", q.as_of.as_deref())?;
     // 画多少个是渲染的事，库里有多少是知识库的事——两个数都回，界面才说得出
     // 「画了 150 个，共 325 个」而不是把上限说成规模
     let limit = q
@@ -65,7 +85,7 @@ pub async fn overview(
         .unwrap_or(GRAPH_NODE_CAP)
         .clamp(10, GRAPH_NODE_CAP_MAX);
     let (nodes, edges, total_nodes, total_edges) =
-        utopia_store::graph::overview(&state.pool, kb_id, limit, at).await?;
+        utopia_store::graph::overview(&state.pool, kb_id, limit, at, as_of).await?;
     Ok(Json(json!({
         "nodes": nodes, "edges": edges,
         "total_nodes": total_nodes, "total_edges": total_edges,
@@ -79,19 +99,28 @@ pub struct NeighborhoodQuery {
     pub hops: Option<u8>,
     #[serde(default)]
     pub at: Option<String>,
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 pub async fn neighborhood(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path(kb_id): Path<Uuid>,
     Query(q): Query<NeighborhoodQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Viewer).await?;
-    let at = parse_at(q.at.as_deref())?;
-    let (nodes, edges) =
-        utopia_store::graph::neighborhood(&state.pool, kb_id, q.entity, q.hops.unwrap_or(2), at)
-            .await?;
+    require_reader_kb(&state, &reader, kb_id).await?;
+    let at = parse_instant("at", q.at.as_deref())?;
+    let as_of = parse_instant("as_of", q.as_of.as_deref())?;
+    let (nodes, edges) = utopia_store::graph::neighborhood(
+        &state.pool,
+        kb_id,
+        q.entity,
+        q.hops.unwrap_or(2),
+        at,
+        as_of,
+    )
+    .await?;
     Ok(Json(json!({ "nodes": nodes, "edges": edges })))
 }
 
@@ -102,15 +131,21 @@ pub struct EntitySearchQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
+    /// 记录轴：回放中的图上点搜索框，结果按**当时**的 `degree` 排（0019）。
+    /// 不给就是当下
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 pub async fn search_entities(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path(kb_id): Path<Uuid>,
     Query(query): Query<EntitySearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    require_reader_kb(&state, &reader, kb_id).await?;
+    // 先校验时刻：一个写错的 `as_of` 配空查询也该回 400，而不是看起来成功
+    let as_of = parse_instant("as_of", query.as_of.as_deref())?;
     if query.q.trim().is_empty() {
         return Ok(Json(json!({ "entities": [], "total": 0 })));
     }
@@ -122,32 +157,53 @@ pub async fn search_entities(
         &query.q,
         query.limit.unwrap_or(10).clamp(1, 100),
         query.offset.unwrap_or(0).max(0),
+        as_of,
     )
     .await?;
     Ok(Json(json!({ "entities": entities, "total": total })))
 }
 
+#[derive(Deserialize)]
+pub struct EntityDetailQuery {
+    /// 记录轴：回放中的图上点开一个节点，面板该说**当时**的事实（0019）
+    #[serde(default)]
+    pub as_of: Option<String>,
+}
+
 pub async fn entity_detail(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path((kb_id, entity_id)): Path<(Uuid, Uuid)>,
+    Query(q): Query<EntityDetailQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Viewer).await?;
-    let (entity, facts) = utopia_store::graph::entity_detail(&state.pool, kb_id, entity_id).await?;
+    require_reader_kb(&state, &reader, kb_id).await?;
+    let as_of = parse_instant("as_of", q.as_of.as_deref())?;
+    // 世界轴不过滤（at = None）：面板要的是整条时间线，「此刻成立」那一档由前端
+    // 按 holds_from / holds_to 分出来（0022）
+    let (entity, facts) =
+        utopia_store::graph::entity_detail(&state.pool, kb_id, entity_id, None, as_of).await?;
     // 推出来的那些**单独回一个键**，不掺进 `facts`。前端据此给它们自己的一档：
     // 一条派生边跟一条断言边混在同一个列表里，用户看不出「这条是文档里写的」
     // 和「这条是引擎推的」的区别，而那正是推理会污染知识的样子
+    // 同一个 as_of（#549）：回放中的面板上，派生那一档也是**当时**推出的
     let derived =
-        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id).await?;
+        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id, None, as_of)
+            .await?;
     // 同名的那些**打开面板时就给**，不是等改名之后才回。
     //
     // 从前它只随 `update_entity` 的响应回来，于是「把同名的合并进来」这个动作
     // 只有先改一次名才够得着——而两个张伟并存是「宁分勿合」的正当产物，不是
     // 改名改出来的。合并入口该长在能看见同名的地方。
-    let same_name = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id).await?;
+    let same_name =
+        utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id, as_of).await?;
+    // 没落地的派生（0017 §3）也单独一个键：它们连 `derived_facts` 都不在
+    let blocked =
+        utopia_store::reasoning::blocked_for_entity(&state.pool, kb_id, entity_id, as_of).await?;
+    // 名字也单独一个键（0041）：本名、简称、曾用名，各带出处与有效期
+    let names = utopia_store::names::for_entity(&state.pool, kb_id, entity_id, as_of).await?;
     Ok(Json(json!({
-        "entity": entity, "facts": facts,
-        "derived": derived, "same_name": same_name,
+        "entity": entity, "facts": facts, "names": names,
+        "derived": derived, "blocked": blocked, "same_name": same_name,
     })))
 }
 
@@ -213,19 +269,286 @@ pub async fn update_entity(
         .await;
     }
 
-    let peers = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id).await?;
+    // 写完之后立刻返回的同名列：这一次问的是当下，不是回放里——传 None 让它
+    // 走「今天」那条路，与面板上没在回放时一致
+    let peers = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id, None).await?;
     state.emit_review(kb_id);
     Ok(Json(json!({ "entity": after, "same_name": peers })))
 }
 
-pub async fn fact_evidence(
+/// 一条事实的新有效区间。**整体替换，不是部分更新**：区间的两端互相定义，
+/// 「把结束端清空」与「这次不动结束端」必须能分辨，而缺字段与 null 在 JSON 里
+/// 分不开。界面提交的是表单里的四个值，不是差异。`end_after_period` 是例外：缺省即
+/// 保留，见那一格。
+#[derive(Deserialize)]
+pub struct FactTimePatch {
+    #[serde(default)]
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub valid_from_precision: Option<String>,
+    #[serde(default)]
+    pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub valid_to_precision: Option<String>,
+    /// 为什么改。落进台账，不进图——「之前记错了」与「新证据说是六月」在账本上
+    /// 长得一样，硬加一个类型枚举会让入口变重而判据模糊；真需要分辨了，再从
+    /// 这里升格成字段
+    #[serde(default)]
+    pub note: Option<String>,
+    /// 终点是不是原文所说时段之后的那一刻（`facts.end_after_period`，#994）。**唯一一个
+    /// 缺省即保留的字段**：读出来什么就发回什么的客户端（不认识这个字段的也一样）不该
+    /// 改掉它。不给时，终点（截到精度之后的值与精度）没变、起点还在，就留着存的标记；清掉
+    /// 起点的保留时刻、丢掉标记（没有起点的行第一刀不标）；别的终点照给的收下。路由从不
+    /// 换算：存的、收的都是边界本身，按时段显示与换算是界面的事
+    #[serde(default)]
+    pub end_after_period: Option<bool>,
+}
+
+// 梯子只有一张（0024）：与数据库的 CHECK、抽取端、显示端同一列
+const DATE_PRECISIONS: [&str; 6] = utopia_store::graph::WORLD_PRECISIONS;
+
+/// 修改前的区间，用于「一字未改」的判定与台账里的前后对照。
+#[derive(sqlx::FromRow)]
+struct FactInterval {
+    valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    valid_from_precision: Option<String>,
+    valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    valid_to_precision: Option<String>,
+    end_after_period: bool,
+    /// 谓词声明成状态：标记只能落在这样的行上
+    declared_state: bool,
+}
+
+/// 显式要标记，却不是一个能带它的终点
+fn bad_end_after_period() -> AppError {
+    AppError::invalid(
+        "bad_end_after_period",
+        "An end that names a period needs a state property, a start and an end date.",
+    )
+}
+
+/// 复刻 `facts` 表的 CHECK：两端的精度，标记要两端带得了它（`period_mark_fits`，属性是不是
+/// 状态读到行之后再查）；外加一条数据库没有的：截到各自精度之后，起点不能晚于终点。
+///
+/// 在这里挡住是为了让错误说人话。交给数据库挡会得到一句约束名，而这三态
+/// （仍在持续 / 结束了不知哪天 / 某日结束）本来就是账本里最容易记混的地方。
+fn check_interval(p: &FactTimePatch) -> Result<(), AppError> {
+    // 起始端：没日期就没精度，且没有 unknown 档——「开始了但不知何时」与
+    // 「不知道有没有开始」在这个账本里不可区分（见迁移 0003 的注释）
+    match (&p.valid_from, p.valid_from_precision.as_deref()) {
+        (Some(_), Some(prec)) if DATE_PRECISIONS.contains(&prec) => {}
+        (None, None) => {}
+        _ => return Err(AppError::invalid(
+            "bad_valid_from",
+            "A start date needs a precision of year, month, day, hour, minute or second, and a precision needs a date.",
+        )),
+    }
+    // 结束端：有日期必有精度；没日期只能是仍在持续（都为空）或结束了不知哪天
+    match (&p.valid_to, p.valid_to_precision.as_deref()) {
+        (Some(_), Some(prec)) if DATE_PRECISIONS.contains(&prec) => {}
+        (None, None) => {}
+        (None, Some(prec)) if prec == utopia_store::graph::ENDED_UNKNOWN => {}
+        _ => {
+            return Err(AppError::invalid(
+                "bad_valid_to",
+                "An end date needs a precision of year, month, day, hour, minute or second. Leave the date empty for still going, or mark it ended with an unknown date.",
+            ))
+        }
+    }
+    // 显式要标记：两端得带得了它。属性是不是状态要读到行才知道，这里先当它是，只看两端
+    if p.end_after_period == Some(true)
+        && !utopia_store::graph::period_mark_fits(true, p.valid_from, p.valid_to, false)
+    {
+        return Err(bad_end_after_period());
+    }
+    // 比截到各自精度之后的两端：存下的就是截过的。比原值时，小时精度的 08:30 终点与分钟精度
+    // 的 08:10 起点放得过去，截完成了 08:10 → 08:00，存下一段倒着的区间
+    let truncate = utopia_store::graph::truncate_to;
+    if let (Some(from), Some(to)) = (p.valid_from, p.valid_to) {
+        if truncate(from, p.valid_from_precision.as_deref())
+            > truncate(to, p.valid_to_precision.as_deref())
+        {
+            return Err(AppError::invalid(
+                "interval_inverted",
+                "The start of the interval is after its end.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 人工修正一条事实的有效区间。抽取给的是初判，此前判错只能删掉文档重抽——
+/// 名字判错有 Review 可改（见 `update_entity`），时间判错没有入口，而这个
+/// 产品卖的正是时间。
+///
+/// 走账本不走原地改：`correct_interval` 作废旧行、插带 `supersedes` 的修正行。
+/// 于是这次修改本身出现在记录轴上（实体面板的 History），世界轴上只留新区间——
+/// 旧区间是我们记错了，不是世界曾经的样子，两段并排会被读成换过两次岗。
+pub async fn update_fact_time(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((kb_id, fact_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<FactTimePatch>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Editor).await?;
+    check_interval(&req)?;
+
+    // 归属与状态校验：本 KB 的、未作废的事实才可改。派生事实不在此列——
+    // 它的区间来自前提，改它等于改一个算出来的值，下一轮推理就会覆盖
+    let before: Option<FactInterval> = sqlx::query_as(
+        "SELECT f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision,
+                f.end_after_period, COALESCE(r.temporal = 'state', false) AS declared_state
+         FROM facts f
+         LEFT JOIN relation_types r ON r.id = f.predicate_id
+         WHERE f.id = $1 AND f.kb_id = $2 AND f.invalidated_at IS NULL
+           AND f.derived_by_rule IS NULL",
+    )
+    .bind(fact_id)
+    .bind(kb_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::Db)?;
+    let Some(before) = before else {
+        return Err(AppError::NotFound.into());
+    };
+    // 存下的是截到精度之后的值：比较、判标记都按它
+    let truncate = utopia_store::graph::truncate_to;
+    let from = req
+        .valid_from
+        .map(|t| truncate(t, req.valid_from_precision.as_deref()));
+    let to = req
+        .valid_to
+        .map(|t| truncate(t, req.valid_to_precision.as_deref()));
+    // 读到了行，属性是不是状态也知道了：显式要的标记按整条规矩再判一遍
+    if req.end_after_period == Some(true)
+        && !utopia_store::graph::period_mark_fits(before.declared_state, from, to, false)
+    {
+        return Err(bad_end_after_period().into());
+    }
+    // 不给标记：发回存的终点（时刻与精度）、这次的两端还带得了它，就是没动它，留着；清掉起点
+    // 的带不了，丢掉（时刻照旧）。属性这里不再判：存的标记是按当时的属性写下的，原样发回的
+    // 请求不改写这一行
+    let end_after_period = match req.end_after_period {
+        Some(mark) => mark,
+        None => {
+            before.end_after_period
+                && to == before.valid_to
+                && req.valid_to_precision == before.valid_to_precision
+                && utopia_store::graph::period_mark_fits(true, from, to, false)
+        }
+    };
+    // 一字未改就不写一条修正进账本：History 上多一行「改过」而区间没动，
+    // 读者会去找那个不存在的差异
+    if before.valid_from == from
+        && before.valid_from_precision == req.valid_from_precision
+        && before.valid_to == to
+        && before.valid_to_precision == req.valid_to_precision
+        && before.end_after_period == end_after_period
+    {
+        return Ok(Json(json!({ "ok": true, "unchanged": true })));
+    }
+
+    let snap = crate::api::review_routes::fact_snapshot(&state, kb_id, fact_id).await;
+    let validity = utopia_store::graph::Validity {
+        from: req.valid_from,
+        from_precision: req.valid_from_precision.as_deref(),
+        to: req.valid_to,
+        to_precision: req.valid_to_precision.as_deref(),
+        // 人改的区间：日期是直接给的，没经过时间解析（0045 第 3 刀按 A 算）
+        from_grade: None,
+        // 修正行从被替代的行继承锚点（correct_interval 的 SQL 里）：改区间是重述
+        // 同一份证据，不是更新的证据
+        attested_at: None,
+        end_after_period,
+    };
+    let Some(corrected) =
+        utopia_store::temporal::correct_interval(&state.pool, fact_id, validity).await?
+    else {
+        // 并发：另一处已经改写或作废了它。让界面重取，不要把两次修正叠起来
+        return Err(AppError::invalid(
+            "fact_changed",
+            "This fact was changed by someone else. Reload and try again.",
+        )
+        .into());
+    };
+
+    // 改完要重新对账：把起点往前挪可能撞上前任的开放区间，那正是时态引擎
+    // 该管的事。复用搬移后的那条路径——换了区间与换了主宾一样，都让唯一性
+    // 不变量第一次看到这次相撞
+    let report =
+        utopia_store::temporal::reconcile_moved_facts(&state.pool, kb_id, &[corrected]).await?;
+
+    if let Some(mut d) = snap {
+        d["from"] = json!({
+            "valid_from": before.valid_from.map(|t| t.to_rfc3339()),
+            "valid_from_precision": before.valid_from_precision,
+            "valid_to": before.valid_to.map(|t| t.to_rfc3339()),
+            "valid_to_precision": before.valid_to_precision,
+            "end_after_period": before.end_after_period,
+        });
+        d["to"] = json!({
+            "valid_from": req.valid_from.map(|t| t.to_rfc3339()),
+            "valid_from_precision": req.valid_from_precision,
+            "valid_to": req.valid_to.map(|t| t.to_rfc3339()),
+            "valid_to_precision": req.valid_to_precision,
+            "end_after_period": end_after_period,
+        });
+        if let Some(note) = req.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            d["note"] = json!(note);
+        }
+        let _ = utopia_store::audit::record(
+            &state.pool,
+            Some(kb_id),
+            user.id,
+            "fact.time_corrected",
+            "fact",
+            Some(fact_id),
+            d,
+        )
+        .await;
+    }
+
+    state.emit_review(kb_id);
+    Ok(Json(json!({
+        "ok": true,
+        "fact_id": corrected,
+        "closed": report.corrected.len(),
+        "conflicts": report.conflicts,
+    })))
+}
+
+pub async fn fact_evidence(
+    State(state): State<AppState>,
+    reader: SessionOrToken,
+    Path((kb_id, fact_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_reader_kb(&state, &reader, kb_id).await?;
+    let evidence = utopia_store::graph::fact_evidence(&state.pool, kb_id, fact_id).await?;
+    Ok(Json(json!({ "evidence": evidence })))
+}
+
+/// 一条派生事实的证明（0002 R2）：前提按推导顺序，每条带证据，一路到原句。
+/// 派生已失效或不存在时 `proof` 为 null——不是错误，界面据此退回文本前提
+pub async fn derived_proof(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, derived_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
-    let evidence = utopia_store::graph::fact_evidence(&state.pool, fact_id).await?;
-    Ok(Json(json!({ "evidence": evidence })))
+    let proof = utopia_store::reasoning::proof(&state.pool, kb_id, derived_id).await?;
+    Ok(Json(json!({ "proof": proof })))
+}
+
+/// 没落地的派生的证明链（0017 §3）：前提在那条 `derived_contradiction` 违规的
+/// `path` 里，展开方式与落了地的一样。违规不存在时 `steps` 为 null
+pub async fn blocked_proof(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, violation_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    let steps = utopia_store::reasoning::blocked_proof(&state.pool, kb_id, violation_id).await?;
+    Ok(Json(json!({ "steps": steps })))
 }
 
 /// 手动触发抽取（failed 重试 / 补配模型后补抽）。
@@ -236,6 +559,20 @@ pub async fn extract(
 ) -> ApiResult<Json<serde_json::Value>> {
     let doc = utopia_store::documents::get(&state.pool, document_id).await?;
     require_kb(&state, &user, doc.kb_id, Role::Editor).await?;
+    // 来源说了不抽取的（schema 文档，0035 决定 7）：说清楚为什么，而不是排一个
+    // 流水线到了那一步又跳过的任务
+    if let Some(source_id) = doc.source_id {
+        if !utopia_store::sources::get(&state.pool, source_id)
+            .await?
+            .extracts()
+        {
+            return Err(utopia_core::AppError::invalid(
+                "source_not_extracted",
+                "Documents under this source are searched, not extracted",
+            )
+            .into());
+        }
+    }
     // 手动触发 = 强制全量：清增量标记、解雇在跑的任务、置 queued、建任务，一个事务办完
     let job_id = utopia_store::documents::queue_extraction_one(&state.pool, document_id).await?;
     state.emit_document(doc.kb_id, document_id);
@@ -290,11 +627,11 @@ fn default_history_per() -> i64 {
 /// 与 entity_detail（有效时间轴，只看现行）互补。
 pub async fn entity_history(
     State(state): State<AppState>,
-    AuthUser(user): AuthUser,
+    reader: SessionOrToken,
     Path((kb_id, entity_id)): Path<(Uuid, Uuid)>,
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    require_reader_kb(&state, &reader, kb_id).await?;
     let per = q.per.clamp(1, 200);
     let page = q.page.max(0);
     let (events, total) =
