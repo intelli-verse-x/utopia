@@ -53,14 +53,36 @@ pub async fn create(
     Json(body): Json<CreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&user)?;
+    // 引擎跟着 scheme 走，界面只有一个连接串输入框；body.engine 只为兼容旧调用留着
+    let engine = crate::query_engine::engine_from_conn(&body.conn_string).ok_or_else(|| {
+        utopia_core::AppError::invalid(
+            "unsupported_conn_scheme",
+            format!(
+                "Connection string must start with one of: postgres://, mysql://, trino://, databricks://, snowflake://, clickhouse:// (engines: {})",
+                crate::query_engine::ENGINES.join(", ")
+            ),
+        )
+    })?;
+    let _ = &body.engine;
+    // 连接串的形状在登记时就校验（缺令牌、缺 warehouse……），错误信息里带写法；
+    // 否则要等到「测试」才知道，而那一步只回 ok:false
+    crate::query_engine::engine_for(engine, &body.conn_string)
+        .map_err(|e| utopia_core::AppError::invalid("bad_conn_string", e.to_string()))?;
     let id = utopia_store::datasources::create(
         &state.pool,
         &body.name,
-        &body.engine,
+        engine,
         &body.conn_string,
         user.id,
     )
     .await?;
+    // **登记完就能挂。** 授权是按工作区的（0014），可工作区在界面上已经隐形——
+    // 单租户部署只有一个，谁也没见过它的名字。从前登记完还要在卡片上先
+    // 「授权给工作区」，等于让人授权一件从没见过的东西，挂载时只得到一句
+    // 「未授权」。所以登记人所在的每个工作区一并授权；要收窄，卡片上仍能撤销
+    for ws in utopia_store::workspaces::list_for_user(&state.pool, user.id).await? {
+        utopia_store::datasources::grant(&state.pool, id, ws.id, user.id).await?;
+    }
     Ok(Json(json!({ "id": id })))
 }
 
@@ -72,6 +94,42 @@ pub async fn delete(
     require_admin(&user)?;
     utopia_store::datasources::delete(&state.pool, id).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct TestConnBody {
+    pub conn_string: String,
+}
+
+/// 存之前先试一次。**这一步不落库**：登记表单里那个「测试连接」按的是它。
+///
+/// 从前只能先存下来再测，测不通还得回头把这条删掉；而 [`test`] 只回 `ok: false`，
+/// 连为什么不通都不说。这里把引擎的报错原样带回去——密码错、库名拼错、
+/// 端口不通，是三件不同的事，人得知道是哪一件。
+pub async fn test_conn(
+    AuthUser(user): AuthUser,
+    Json(body): Json<TestConnBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&user)?;
+    let engine = crate::query_engine::engine_from_conn(&body.conn_string).ok_or_else(|| {
+        AppError::invalid(
+            "unsupported_conn_scheme",
+            format!(
+                "Connection string must start with one of: postgres://, mysql://, trino://, databricks://, snowflake://, clickhouse:// (engines: {})",
+                crate::query_engine::ENGINES.join(", ")
+            ),
+        )
+    })?;
+    // 连接串的形状（缺令牌、缺 warehouse……）与连得上连不上分开报：前者是写错了，
+    // 后者是环境问题，两句话对人的下一步动作不一样
+    let eng = crate::query_engine::engine_for(engine, &body.conn_string)
+        .map_err(|e| AppError::invalid("bad_conn_string", e.to_string()))?;
+    match eng.test().await {
+        Ok(()) => Ok(Json(json!({ "ok": true, "engine": engine }))),
+        Err(e) => Ok(Json(
+            json!({ "ok": false, "engine": engine, "error": e.to_string() }),
+        )),
+    }
 }
 
 pub async fn test(
@@ -190,7 +248,21 @@ pub async fn sync_schema(
         Err(e) => {
             let name = source_name(&state, ds_id).await;
             crate::alerting::observe_schema_sync_failure(&state, kb_id, ds_id, &name, &e).await;
-            Err(AppError::Other(e).into())
+            // **读不出结构回 422 带引擎原话**；我们自己这边出的错（库、写文档）照旧 500。
+            // 从前一律 AppError::Other，界面只有「Internal server error」，原因只在服务端
+            // 日志里——而 Invalid 不打日志，所以这里自己记一行
+            match e.downcast_ref::<SchemaUnreadable>() {
+                Some(unreadable) => {
+                    tracing::warn!(%kb_id, %ds_id, error = %unreadable, "数据源结构读取失败");
+                    Err(AppError::invalid_detail(
+                        "schema_sync_failed",
+                        "The data source's schema could not be read",
+                        bounded(&unreadable.to_string(), 600),
+                    )
+                    .into())
+                }
+                None => Err(AppError::Other(e).into()),
+            }
         }
     }
 }
@@ -214,6 +286,27 @@ pub async fn explore(
 
 /// 拉 information_schema 生成 markdown，走三路判定摄入（同 key 原地更新）。
 /// 文档挂在 per-KB 的 "Data schemas" folder 来源下。
+/// 引擎读不出库表结构（连接、权限、catalog 不存在……），与我们自己这边出错分开：
+/// 前者是连接串或权限的事，回给点按钮的人；后者照旧是 500
+#[derive(Debug)]
+struct SchemaUnreadable(String);
+
+impl std::fmt::Display for SchemaUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaUnreadable {}
+
+/// 截到 `max` 个字符以内（按字符边界），引擎的报错可能带整段堆栈
+fn bounded(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
 async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::Result<usize> {
     const MAX_TABLES: usize = 200;
     let name = utopia_store::datasources::list(&state.pool)
@@ -225,10 +318,11 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
     let (engine, conn) = utopia_store::datasources::engine_and_conn(&state.pool, ds_id).await?;
     let cols = crate::query_engine::engine_for(&engine, &conn)?
         .fetch_schema()
-        .await?;
+        .await
+        .map_err(|e| anyhow::Error::new(SchemaUnreadable(e.to_string())))?;
 
     let mut md = format!(
-        "# Data source: {name}\n\nTables and columns available for SQL queries against this source.\n"
+        "# Data source: {name}\n\nEngine: {engine}. Tables and columns available for SQL queries against this source; write SQL in this engine's dialect.\n"
     );
     let mut current = String::new();
     let mut tables = 0usize;
@@ -254,7 +348,11 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
         ));
     }
 
-    // per-KB "Data schemas" 容器来源（folder：纯容器语义）
+    // per-KB "Data schemas" 容器来源（folder：纯容器语义）。
+    //
+    // **这份文档只做检索语料，不进抽取**（0035 决定 7）。它跟别的文档一样进抽取的
+    // 时候，抽取器把每个列名都当成了实体——宽表语料上四十个概念实体里二十八个是
+    // 列名（#553）。「不抽取」记在来源的 config 上，流水线读它
     let folder = match sqlx::query_as::<_, (Uuid,)>(
         "SELECT id FROM sources WHERE kb_id = $1 AND kind = 'folder' AND name = 'Data schemas'",
     )
@@ -269,7 +367,7 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
                 kb_id,
                 "folder",
                 "Data schemas",
-                &serde_json::json!({}),
+                &serde_json::json!({ "extract": false }),
                 Some("database"),
                 None,
                 None,

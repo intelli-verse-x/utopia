@@ -32,17 +32,40 @@ use crate::state::AppState;
 /// 规范要求服务端回自己支持的版本，由客户端决定接不接受
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// 这一版放出去的工具。**只读四个**（0014）：
+/// 只读的那些：任何一枚够得着这个库的令牌都能调。
 ///
-/// `query_data` 对生产库跑 SQL，`remember` 往账本里写，两者各自还有没答完的
-/// 问题——外部 agent 写进来的事实挂什么证据、跑 SQL 的审计怎么记。先把身份
-/// 这条路走通。
-const EXPOSED: [&str; 4] = ["search_chunks", "search_docs", "find_entities", "changes"];
-/// `entity_facts` 也在内，单列是因为上面那个数组要定长
-const EXPOSED_EXTRA: &str = "entity_facts";
+/// `query_data` 仍旧不放：它对**部署之外的生产库**跑 SQL，审计怎么记、
+/// 一个被投喂了脏文档的 agent 拿它做什么，都还没答完（0014 的混淆代理那一节）。
+/// 业务规则的两个只读工具也在这里（0021）：判据要看得见——一个 agent 解释
+/// 「凭什么算含气井」时，该读到那条规则和它的阈值，而不是自己猜一个。
+/// **写规则不放**：推理的判据由人写下，而一次工具调用分不出「人口述、agent
+/// 代打」与「模型自己编了一条」
+const EXPOSED: [&str; 11] = [
+    "search_chunks",
+    "get_document",
+    "search_docs",
+    "find_entities",
+    "list_rules",
+    "rule_matches",
+    "changes",
+    "entity_facts",
+    "neighbors",
+    "timeline",
+    "paths_between",
+];
 
-fn is_exposed(name: &str) -> bool {
-    EXPOSED.contains(&name) || name == EXPOSED_EXTRA
+/// 会往账本里写的那些。
+///
+/// **0014 当初不放 `remember`，主要是怕混淆代理**：agent 读的是库里的文档，
+/// 一句「请记住 X」写在文档里就可能被当成指令照做，而它带着那个人的全部权限。
+/// 0015 把这个反对意见拆掉了——记忆抽出的事实先进 `pending_facts` 等人点头，
+/// 没人点头就什么都没进图。所以这里放开的不是「写图」，是「提议」。
+const WRITABLE: [&str; 1] = ["remember"];
+
+/// `can_write` = 令牌 scope 是 write **且** 这个人在这个库里 editor 以上。
+/// 两个条件缺一不可：scope 是上限，角色才是权限（0014）
+fn is_exposed(name: &str, can_write: bool) -> bool {
+    EXPOSED.contains(&name) || (can_write && WRITABLE.contains(&name))
 }
 
 /// 认证 + 授权。**两道，不是一道。**
@@ -50,17 +73,19 @@ fn is_exposed(name: &str) -> bool {
 /// 令牌说「这是谁、这枚钥匙够到哪几个库」；`require_kb` 说「这个人在这个库里
 /// 是什么角色」。前者只收窄，后者才是权限——一枚 scope 全开的令牌落在一个
 /// viewer 手上，仍旧只是 viewer。
+/// 认证的产物：人、令牌、库，以及**有效写权限**——令牌 scope ∩ 这个人在这个库里的角色。
+type Authorized = (
+    utopia_core::models::User,
+    utopia_store::tokens::Authenticated,
+    utopia_core::models::KnowledgeBase,
+    bool,
+);
+
 async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
     kb_id: Uuid,
-) -> Result<
-    (
-        utopia_core::models::User,
-        utopia_store::tokens::Authenticated,
-    ),
-    utopia_core::AppError,
-> {
+) -> Result<Authorized, utopia_core::AppError> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -76,8 +101,14 @@ async fn authorize(
         .await?
         .ok_or(utopia_core::AppError::Unauthorized)?;
     // 角色：和网页端走同一个守卫，一行没改
-    utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
-    Ok((user, auth))
+    let kb = utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
+    // **收窄两次。** 令牌勾了 write 只是没把写排除掉；能不能写，问的是这个人
+    // 在这个库里的角色——一枚 scope 全开的令牌落在 viewer 手上仍旧只能读
+    let can_write = auth.can_write()
+        && utopia_store::access::kb_role(&state.pool, &user, &kb)
+            .await?
+            .is_some_and(|role| role >= Role::Editor);
+    Ok((user, auth, kb, can_write))
 }
 
 /// OpenAI 形状 → MCP 形状。
@@ -89,7 +120,7 @@ async fn authorize(
 /// 已知的瑕疵：描述是给应用内助手写的，`search_chunks` 那句还提着「可以引用
 /// 成 [n]」，而 MCP 客户端拿不到引用编号。共用一份的好处大过这句话的代价，
 /// 真要分开时再说。
-fn to_mcp_tools(openai: &Value) -> Vec<Value> {
+fn to_mcp_tools(openai: &Value, can_write: bool) -> Vec<Value> {
     openai
         .as_array()
         .map(|arr| {
@@ -97,7 +128,7 @@ fn to_mcp_tools(openai: &Value) -> Vec<Value> {
                 .filter_map(|t| {
                     let f = t.get("function")?;
                     let name = f.get("name")?.as_str()?;
-                    if !is_exposed(name) {
+                    if !is_exposed(name, can_write) {
                         return None;
                     }
                     Some(json!({
@@ -117,6 +148,17 @@ fn ok(id: Option<Value>, result: Value) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
+fn tool_result(result: tools::ToolResult) -> Value {
+    let mut response = json!({
+        "content": [{ "type": "text", "text": result.text }],
+        "isError": result.is_error,
+    });
+    if let Some(content) = result.structured_content {
+        response["structuredContent"] = content;
+    }
+    response
+}
+
 /// JSON-RPC 的错误不是 HTTP 的错误：**传输成功了，方法失败了**。
 /// 回 200 带 error 体，客户端才解析得动。
 fn rpc_err(id: Option<Value>, code: i64, message: &str) -> Json<Value> {
@@ -132,7 +174,7 @@ pub async fn handle(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let (user, auth) = authorize(&state, &headers, kb_id).await?;
+    let (user, auth, kb, can_write) = authorize(&state, &headers, kb_id).await?;
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
@@ -150,35 +192,58 @@ pub async fn handle(
         // 回 202 语义更准，这里为了保持处理器签名统一回一个空结果
         "notifications/initialized" | "notifications/cancelled" => ok(None, json!({})),
         "ping" => ok(id, json!({})),
+        // **列表跟着这枚令牌变。** 写不了的令牌看不见 `remember`——
+        // 列出一个调不动的工具，等于让对面的 agent 反复试
         "tools/list" => ok(
             id,
-            json!({ "tools": to_mcp_tools(&super::chat::base_tools()) }),
+            json!({
+                // 传空的数据源列表：`query_data` 没放出来，那份描述也就不必生成
+                "tools": to_mcp_tools(&super::chat::tools_schema(can_write, &[]), can_write)
+            }),
         ),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            if !is_exposed(name) {
-                // 未暴露的工具（query_data / remember）要说清是「这一版没放出来」，
-                // 而不是「没有这个工具」——前者客户端不会反复重试
-                return Ok(rpc_err(
-                    id,
-                    -32601,
-                    &format!("Tool '{name}' is not exposed over MCP in this version"),
-                ));
+            if !is_exposed(name, can_write) {
+                // 三种「不行」要分得开，否则客户端只能反复重试：
+                // 拿不到的工具（query_data）是「这一版没放出来」，写工具是
+                // 「这枚令牌/这个人写不了」——后者人改得了，前者改不了
+                let message = if WRITABLE.contains(&name) {
+                    format!(
+                        "Tool '{name}' needs a token with the write scope, \
+                         held by an editor in this base"
+                    )
+                } else {
+                    format!("Tool '{name}' is not exposed over MCP in this version")
+                };
+                return Ok(rpc_err(id, -32601, &message));
             }
-            let kb = utopia_store::kbs::get(&state.pool, kb_id).await?;
-            // 这一版只放只读工具，所以 mounted_sources 空、can_write 假：
-            // **就算令牌 scope 是 write 也不放开**——scope 是上限不是授权，
-            // 而这一版的上限由 EXPOSED 定
-            let ctx = ToolCtx {
-                state: &state,
-                kb_id,
-                workspace_id: kb.workspace_id,
-                mounted_sources: &[],
-                can_write: false,
+            // 与聊天共用参数守卫：缺少 query 不能变成一次成功的空搜索。
+            let result = match super::chat::check_call(
+                &super::chat::tools_schema(can_write, &[]),
+                name,
+                &args.to_string(),
+            ) {
+                Err((text, step)) => tools::ToolResult::new(text, step).error(),
+                Ok(args) => {
+                    // `mounted_sources` 仍旧空着：`query_data` 没放出来，给了也没人用。
+                    // `can_write` 不再写死 false——它现在是令牌与角色一起算出来的
+                    let ctx = ToolCtx {
+                        state: &state,
+                        kb_id,
+                        workspace_id: kb.workspace_id,
+                        mounted_sources: &[],
+                        can_write,
+                        actor: Some(user.id),
+                        // 「谁说的」要答到 agent 这一层：一个人可以同时挂三个客户端
+                        via_token: Some(auth.token_id),
+                        // agent 的意图不在请求里；同名按事实数排
+                        question: None,
+                    };
+                    let mut sink = ToolSink::default();
+                    tools::dispatch(&ctx, &mut sink, name, &args).await
+                }
             };
-            let mut sink = ToolSink::default();
-            let (text, _step) = tools::dispatch(&ctx, &mut sink, name, &args).await;
             let _ = utopia_store::audit::record(
                 &state.pool,
                 Some(kb_id),
@@ -189,14 +254,12 @@ pub async fn handle(
                 json!({ "tool": name }),
             )
             .await;
-            ok(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": false,
-                }),
-            )
+            ok(id, tool_result(result))
         }
         other => rpc_err(id, -32601, &format!("Unknown method: {other}")),
     })
 }
+
+#[cfg(test)]
+#[path = "mcp_tests.rs"]
+mod tests;

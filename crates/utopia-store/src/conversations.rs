@@ -1,7 +1,6 @@
 //! Chat 会话持久化：对话/消息仓储。轨迹（steps）与引用（sources）随
 //! assistant 消息落库，历史回放与实时流共用同一数据形状。
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use utopia_core::models::{ConversationMessage, ConversationView};
 use utopia_core::{AppError, AppResult};
@@ -44,7 +43,7 @@ pub async fn list(
                  WHERE m.conversation_id = c.id) AS message_count
          FROM conversations c
          {WHERE}
-         ORDER BY c.updated_at DESC
+         ORDER BY c.updated_at DESC, c.id DESC
          LIMIT $4 OFFSET $5"
     ))
     .bind(kb_id)
@@ -117,13 +116,49 @@ pub async fn require_owned(
 
 pub async fn messages(pool: &PgPool, conversation_id: Uuid) -> AppResult<Vec<ConversationMessage>> {
     let rows: Vec<ConversationMessage> = sqlx::query_as(
-        "SELECT id, role, content, steps, sources, created_at
+        "SELECT id, role, content, steps, sources, stopped, created_at
          FROM conversation_messages WHERE conversation_id = $1 ORDER BY created_at",
     )
     .bind(conversation_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// 重答（#936）要找的那条消息：它的角色、正文，以及它是不是这场对话的最后一条。
+pub struct RetryTarget {
+    pub role: String,
+    pub content: String,
+    pub last: bool,
+}
+
+/// 读出要重答的那条消息；不在这场对话里的 id 交回 `None`。
+///
+/// 回答与问题之间没有连线，靠的是顺序（`created_at`，同一刻再按 id）。所以「还没有
+/// 回答」只能这样判断：这一问后面什么也没有。后面有回答，是答过了；后面有人接着问，
+/// 这时再答，答案会落在那些轮之后，顺序就乱了。两种都不能原地重答
+pub async fn retry_target(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    message_id: Uuid,
+) -> AppResult<Option<RetryTarget>> {
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT m.role, m.content, NOT EXISTS (
+             SELECT 1 FROM conversation_messages later
+              WHERE later.conversation_id = m.conversation_id
+                AND (later.created_at, later.id) > (m.created_at, m.id))
+           FROM conversation_messages m
+          WHERE m.id = $2 AND m.conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(role, content, last)| RetryTarget {
+        role,
+        content,
+        last,
+    }))
 }
 
 /// 一轮回放的历史。
@@ -136,10 +171,15 @@ pub async fn messages(pool: &PgPool, conversation_id: Uuid) -> AppResult<Vec<Con
 /// 「我已经查过了」这件事也一起省掉了：跨轮之后模型只看得见自己写的散文，
 /// 于是接着说「翻译」时重查一遍，还落到了另一批同名实体上。
 ///
-/// 折中是**只回放最近一轮**：需要的是「我刚做过什么」，不是二十轮的输出。
+/// 工具往返**只回放最近一轮**：需要的是「我刚做过什么」，不是二十轮的输出。
+/// 协议要求的终答推理则随各条正文回放，不属于可以单独裁掉的工具证据。
 pub struct History {
+    /// Identities parallel to turns, so callers can exclude their own appended question.
+    pub turn_ids: Vec<Uuid>,
     /// `(role, content)`，按时间序
     pub turns: Vec<(String, String)>,
+    /// 终答的协议推理，和 `turns` 一一对应；不混入用户看到的正文。
+    pub reasoning: Vec<Option<String>>,
     /// 这场对话里已经认下的实体（去重）
     pub entities: Vec<serde_json::Value>,
     /// **最近一轮助手做过什么**：带 `tool_calls` 的助手消息与配套的 tool 结果。
@@ -149,17 +189,26 @@ pub struct History {
     /// 另一批同名实体）。搬二十轮的工具输出回来是另一回事，那正是当初
     /// 只存正文的理由。
     pub last_tool_exchange: Vec<serde_json::Value>,
+    /// 同一条助手消息的来源（#943）。不查东西的改写会照抄那条回答的 `[n]`，
+    /// 这一轮拿它们接上，号才点得开
+    pub last_sources: Vec<serde_json::Value>,
+}
+
+/// `recent_context` 读的一行消息
+#[derive(sqlx::FromRow)]
+struct ContextRow {
+    id: Uuid,
+    role: String,
+    content: String,
+    resolved: serde_json::Value,
+    tool_exchange: serde_json::Value,
+    sources: serde_json::Value,
+    stopped: bool,
 }
 
 pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> AppResult<History> {
-    let mut rows: Vec<(
-        String,
-        String,
-        serde_json::Value,
-        serde_json::Value,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
-        "SELECT role, content, resolved, tool_exchange, created_at FROM conversation_messages
+    let mut rows: Vec<ContextRow> = sqlx::query_as(
+        "SELECT id, role, content, resolved, tool_exchange, sources, stopped FROM conversation_messages
          WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT $2",
     )
     .bind(conversation_id)
@@ -167,12 +216,23 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
     .fetch_all(pool)
     .await?;
     rows.reverse();
+    Ok(history_from_rows(rows))
+}
+
+fn reasoning_metadata(message: &serde_json::Value) -> bool {
+    message["role"] == "assistant"
+        && message.get("tool_calls").is_none()
+        && message.get("content").is_none()
+        && message.get("reasoning_content").is_some()
+}
+
+fn history_from_rows(rows: Vec<ContextRow>) -> History {
     // 实体按 id 去重、保持首次出现的顺序：同一个实体在几轮里反复出现是常态，
     // 每轮各列一遍只是把同一件事说三遍
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entities: Vec<serde_json::Value> = Vec::new();
-    for (_, _, res, _, _) in &rows {
-        for e in res.as_array().into_iter().flatten() {
+    for row in &rows {
+        for e in row.resolved.as_array().into_iter().flatten() {
             let Some(id) = e["id"].as_str() else { continue };
             if seen.insert(id.to_string()) {
                 entities.push(e.clone());
@@ -180,17 +240,47 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
         }
     }
     // 最后一条助手消息的那一段。**倒着找**——最后一条通常是刚落库的用户消息
-    let last_tool_exchange = rows
-        .iter()
-        .rev()
-        .find(|(role, _, _, _, _)| role == "assistant")
-        .and_then(|(_, _, _, ex, _)| ex.as_array().cloned())
+    let last_assistant = rows.iter().rev().find(|row| row.role == "assistant");
+    let mut last_tool_exchange = last_assistant
+        .and_then(|row| row.tool_exchange.as_array().cloned())
         .unwrap_or_default();
-    Ok(History {
-        turns: rows.into_iter().map(|(r, c, _, _, _)| (r, c)).collect(),
+    last_tool_exchange.retain(|m| !reasoning_metadata(m));
+    let last_sources = last_assistant
+        .and_then(|row| row.sources.as_array().cloned())
+        .unwrap_or_default();
+    History {
+        turn_ids: rows.iter().map(|row| row.id).collect(),
+        reasoning: rows
+            .iter()
+            .map(|row| {
+                if row.role != "assistant" {
+                    return None;
+                }
+                row.tool_exchange
+                    .as_array()?
+                    .iter()
+                    .rev()
+                    .find(|m| reasoning_metadata(m))?["reasoning_content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect(),
+        turns: rows
+            .into_iter()
+            .map(|mut row| {
+                if row.stopped {
+                    row.content = format!(
+                        "[This response was stopped by the user before completion.]\n\n{}",
+                        row.content
+                    );
+                }
+                (row.role, row.content)
+            })
+            .collect(),
         entities,
         last_tool_exchange,
-    })
+        last_sources,
+    }
 }
 
 /// 一轮除了正文之外留下的东西。
@@ -199,6 +289,8 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
 /// 一条能落库、也能读回来、只是内容张冠李戴的记录。与 `RelationAxioms` 同一条理由。
 #[derive(Default)]
 pub struct TurnRecord {
+    /// 用户明确停止了这一轮，正文可能只有一部分或为空。
+    pub stopped: bool,
     /// 行动轨迹：调了什么、拿到多少（界面显示）
     pub steps: serde_json::Value,
     /// 引用清单
@@ -206,7 +298,8 @@ pub struct TurnRecord {
     /// 这一轮认下的实体（id / 名字 / 类型）。下一轮回放，让模型接着走而不是重搜
     pub resolved: serde_json::Value,
     /// 这一轮调了什么、拿回什么（已截断的那一份）。下一轮回放最近的一段——
-    /// 没有它，模型跨轮之后就不知道自己查过，于是重查
+    /// 没有它，模型跨轮之后就不知道自己查过，于是重查。
+    /// 末尾可附仅含 `role` 和 `reasoning_content` 的终答协议 metadata。
     pub tool_exchange: serde_json::Value,
 }
 
@@ -214,6 +307,7 @@ impl TurnRecord {
     /// 用户消息：四样都空。
     pub fn empty() -> Self {
         Self {
+            stopped: false,
             steps: serde_json::json!([]),
             sources: serde_json::json!([]),
             resolved: serde_json::json!([]),
@@ -233,8 +327,8 @@ pub async fn append_message(
     let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO conversation_messages
-             (id, conversation_id, role, content, steps, sources, resolved, tool_exchange)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             (id, conversation_id, role, content, steps, sources, resolved, tool_exchange, stopped)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(id)
     .bind(conversation_id)
@@ -244,6 +338,7 @@ pub async fn append_message(
     .bind(&rec.sources)
     .bind(&rec.resolved)
     .bind(&rec.tool_exchange)
+    .bind(rec.stopped)
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE conversations SET updated_at = now() WHERE id = $1")
@@ -271,4 +366,58 @@ pub async fn delete(
         return Err(AppError::NotFound);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn history_separates_terminal_reasoning_from_tool_exchanges() {
+        let row = |role: &str, tool_exchange| ContextRow {
+            id: Uuid::now_v7(),
+            role: role.into(),
+            content: "same text".into(),
+            resolved: json!([]),
+            tool_exchange,
+            sources: json!([]),
+            stopped: false,
+        };
+        let call = json!({"role":"assistant","reasoning_content":"tool thought",
+            "tool_calls":[{"id":"c"}]} );
+        let result = json!({"role":"tool","tool_call_id":"c","content":"ok"});
+        let history = history_from_rows(vec![
+            row("user", json!([])),
+            row("assistant", json!([])),
+            row(
+                "assistant",
+                json!([{"role":"assistant","reasoning_content":"older thought"}]),
+            ),
+            row(
+                "assistant",
+                json!([{"role":"assistant","reasoning_content":7}]),
+            ),
+            row(
+                "assistant",
+                json!([call.clone(), result.clone(),
+                {"role":"assistant","reasoning_content":""}]),
+            ),
+            row("user", json!([])),
+        ]);
+        assert_eq!(
+            history.reasoning,
+            [
+                None,
+                None,
+                Some("older thought".into()),
+                None,
+                Some(String::new()),
+                None
+            ]
+        );
+        assert_eq!(history.reasoning.len(), history.turns.len());
+        assert_eq!(history.turn_ids.len(), history.turns.len());
+        assert_eq!(history.last_tool_exchange, [call, result]);
+    }
 }

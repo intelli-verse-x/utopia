@@ -1,13 +1,122 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Pencil, Plus, Search } from "lucide-react";
 import { api } from "../api";
 import { S } from "../i18n";
-import { toast } from "../toast";
-import { Dropdown, Pager, pageSlice, SearchSelect } from "../ui";
+import { memberChanges } from "./memberChanges";
+import {
+  Button,
+  Checkbox,
+  Chip,
+  DangerConfirm,
+  Dialog,
+  Dropdown,
+  Field,
+  FormDialog,
+  IconButton,
+  Input,
+  Pager,
+  REVEAL,
+  SearchSelect,
+  TBody,
+  THead,
+  Table,
+  Td,
+  Th,
+  Tr,
+  cn,
+  pageSlice,
+} from "../ui";
+import { fetchMe } from "../authSession";
 
 const ROLES = ["owner", "admin", "editor", "viewer"] as const;
 const ROLE_OPTIONS = ROLES.map((r) => ({ value: r, label: S.members.roles[r] }));
 const MEMBER_PAGE = 10;
+
+/** 名单里的一行。停用的账号也是一行——它没有工作区角色，别的都一样 */
+type Person = {
+  user_id: string;
+  display_name: string;
+  email: string;
+  role: string;
+  is_admin: boolean;
+  deactivated: boolean;
+};
+
+/** 一个成员的弹窗：改身份在正文，停用与移出在左下角。
+ *
+ *  **停用和移出是两件事**，所以是两个按钮而不是一个：前者断掉这个人在整个
+ *  部署里的访问（只有管理员做得了，影响面大得多，还要再过一道确认），
+ *  后者只是这个工作区不再有他。挤成一个按钮就得让人自己猜点下去会发生什么。 */
+function MemberDialog({
+  member,
+  canDeactivate,
+  canSetAdmin,
+  isSelf,
+  busy,
+  onSave,
+  onDeactivate,
+  onRemove,
+  onClose,
+}: {
+  member: Person;
+  canDeactivate: boolean;
+  canSetAdmin: boolean;
+  isSelf: boolean;
+  busy: boolean;
+  onSave: (changes: ReturnType<typeof memberChanges>) => void;
+  onDeactivate: () => void;
+  onRemove: () => void;
+  onClose: () => void;
+}) {
+  const [role, setRole] = useState(member.role);
+  const [isAdmin, setIsAdmin] = useState(member.is_admin);
+  const changes = memberChanges(member, { role, is_admin: isAdmin });
+  return (
+    <FormDialog
+      title={member.display_name}
+      description={member.email}
+      width="sm"
+      closeLabel={S.members.close}
+      saveLabel={S.members.save}
+      cancelLabel={S.members.cancel}
+      canSave={Object.keys(changes).length > 0}
+      busy={busy}
+      onSave={() => onSave(changes)}
+      onCancel={onClose}
+      danger={[
+        ...(canDeactivate
+          ? [
+              {
+                label: S.members.deactivate,
+                title: S.members.deactivateHint,
+                onClick: onDeactivate,
+              },
+            ]
+          : []),
+        { label: S.members.remove, onClick: onRemove },
+      ]}
+    >
+      <Field label={S.members.roleLabel}>
+        <Dropdown
+          className="w-full"
+          value={role}
+          onChange={setRole}
+          options={ROLE_OPTIONS}
+        />
+      </Field>
+      {canSetAdmin && (
+        <Checkbox
+          label={S.members.systemAdmin}
+          hint={S.members.systemAdminHint}
+          checked={isAdmin}
+          disabled={isSelf && member.is_admin}
+          onChange={setIsAdmin}
+        />
+      )}
+    </FormDialog>
+  );
+}
 
 export function Members({ workspaceId }: { workspaceId: string }) {
   const queryClient = useQueryClient();
@@ -15,7 +124,14 @@ export function Members({ workspaceId }: { workspaceId: string }) {
   const [addRole, setAddRole] = useState("viewer");
   const [memberPage, setMemberPage] = useState(0);
   const [filter, setFilter] = useState("");
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // 看在用的、看停用的，还是都看。缺省只看在用的：那是这一页平时的问题
+  const [status, setStatus] = useState<"all" | "active" | "deactivated">("active");
+  const [creating, setCreating] = useState(false);
+  const [adding, setAdding] = useState(false);
+  // 角色平时是一行字，点了才变成下拉——同时只有一行在编辑
+  // 按角色筛
+  const [role, setRole] = useState("all");
+  const me = useQuery({ queryKey: ["me"], queryFn: fetchMe });
   const [error, setError] = useState<string | null>(null);
 
   const members = useQuery({
@@ -23,6 +139,14 @@ export function Members({ workspaceId }: { workspaceId: string }) {
     queryFn: () => api.members(workspaceId),
   });
   const orgUsers = useQuery({ queryKey: ["orgUsers"], queryFn: api.orgUsers });
+  /* 停用的账号是部署级的，成员表里查不到（停用之后那个人从成员表、选人器、
+     每一个列表里消失）——所以另取一次，再并进同一份名单。**只有管理员看得到**：
+     恢复也只有他能做 */
+  const deactivated = useQuery({
+    queryKey: ["deactivatedUsers"],
+    queryFn: api.deactivatedUsers,
+    enabled: !!me.data?.is_admin,
+  });
 
   const refresh = () => {
     setError(null);
@@ -30,9 +154,15 @@ export function Members({ workspaceId }: { workspaceId: string }) {
   };
   const onError = (e: unknown) => setError((e as Error).message);
 
-  const setRole = useMutation({
+  const setRole_ = useMutation({
     mutationFn: ({ userId, role }: { userId: string; role: string }) =>
       api.setMemberRole(workspaceId, userId, role),
+    onSuccess: refresh,
+    onError,
+  });
+  const setSystemAdmin = useMutation({
+    mutationFn: ({ userId, isAdmin }: { userId: string; isAdmin: boolean }) =>
+      api.adminSetSystemAdmin(userId, isAdmin),
     onSuccess: refresh,
     onError,
   });
@@ -41,192 +171,308 @@ export function Members({ workspaceId }: { workspaceId: string }) {
     onSuccess: refresh,
     onError,
   });
+  // 停用先问一句——用全站的对话框而不是浏览器原生 confirm()
+  // 正在编辑的那个成员（行尾的铅笔打开它）
+  const [editing, setEditing] = useState<Person | null>(null);
+  const [deactivating, setDeactivating] = useState<{ id: string; name: string } | null>(
+    null,
+  );
   const deactivate = useMutation({
     mutationFn: (userId: string) => api.adminDeactivateUser(userId),
-    onSuccess: refresh,
+    onSuccess: () => {
+      refresh();
+      queryClient.invalidateQueries({ queryKey: ["deactivatedUsers"] });
+    },
+    onError,
+  });
+  const revive = useMutation({
+    mutationFn: (userId: string) => api.adminReactivateUser(userId),
+    onSuccess: () => {
+      refresh();
+      queryClient.invalidateQueries({ queryKey: ["deactivatedUsers"] });
+      queryClient.invalidateQueries({ queryKey: ["orgUsers"] });
+    },
     onError,
   });
 
   const memberIds = new Set(members.data?.map((m) => m.user_id));
   const addable = orgUsers.data?.filter((u) => !memberIds.has(u.id)) ?? [];
+
+  /* **停用不是另一张表，是这份名单里的一种状态。**
+     从前它单独一块挂在页尾：同一个人在两个地方各出现一次，而"这个账号还在不在"
+     恰恰是看名单时最先要问的一件事。合成一份之后，它变成一个可筛的状态 */
+  const people: Person[] = [
+    ...(members.data ?? []).map((m) => ({ ...m, deactivated: false })),
+    ...(deactivated.data ?? []).map((u) => ({
+      user_id: u.id,
+      display_name: u.display_name,
+      email: u.email,
+      role: "",
+      is_admin: u.is_admin,
+      deactivated: true,
+    })),
+  ];
   const q = filter.trim().toLowerCase();
-  const memberList = (members.data ?? []).filter(
-    (m) =>
-      !q || m.display_name.toLowerCase().includes(q) || m.email.toLowerCase().includes(q),
-  );
+  const memberList = people
+    .filter((p) => status === "all" || (status === "deactivated") === p.deactivated)
+    .filter((p) => role === "all" || p.role === role)
+    .filter(
+      (p) =>
+        !q ||
+        p.display_name.toLowerCase().includes(q) ||
+        p.email.toLowerCase().includes(q),
+    )
+    // 停用的沉底：他们仍然列着，但不该排在还在用的人前面
+    .sort((a, b) => Number(a.deactivated) - Number(b.deactivated));
   const { rows: pagedMembers, safe: safeMemberPage } = pageSlice(memberList, memberPage, MEMBER_PAGE);
 
+  const reset = (fn: () => void) => {
+    fn();
+    setMemberPage(0);
+  };
+
   return (
-    <div className="glass rounded-xl p-5">
-      <div className="flex items-center gap-3 mb-3">
-        <h3 className="text-sm font-bold text-neutral-200">{S.members.title}</h3>
-        <input
-          className="input-dark ml-auto w-56 px-2.5 py-1 text-xs"
+    <div className="space-y-4">
+      {/* 筛这份名单的东西在表格外面（DESIGN.md 6）：三个筛子同一副身材——
+          带放大镜的中号输入框 + 两个下拉，与图谱、文库那几页的筛选条一致 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          icon={<Search size={13} />}
+          className="w-64"
           placeholder={S.settings.searchUsers}
           value={filter}
-          onChange={(e) => {
-            setFilter(e.target.value);
-            setMemberPage(0);
+          onChange={(e) => reset(() => setFilter(e.target.value))}
+        />
+        <Dropdown
+          className="w-32"
+          value={role}
+          onChange={(v) => reset(() => setRole(v))}
+          options={[
+            { value: "all", label: S.members.filterAllRoles },
+            ...ROLE_OPTIONS,
+          ]}
+        />
+        {me.data?.is_admin && (
+          <Dropdown
+            className="w-36"
+            value={status}
+            onChange={(v) => reset(() => setStatus(v as typeof status))}
+            options={[
+              { value: "active", label: S.members.filterActive },
+              { value: "deactivated", label: S.members.filterDeactivated },
+              { value: "all", label: S.members.filterAll },
+            ]}
+          />
+        )}
+        <div className="ml-auto flex items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={() => setAdding(true)}>
+            {S.members.addExisting}
+          </Button>
+          {me.data?.is_admin && (
+            <Button variant="primary" size="sm" onClick={() => setCreating(true)}>
+              <Plus size={12} />
+              {S.settings.newUser}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {error && <p className="text-body text-danger">{error}</p>}
+
+      {/* 一张表：每一列宽度定死，角色、动作都在自己那一列里，不再随名字长短漂移 */}
+      <div className="glass rounded-panel overflow-hidden">
+        <Table>
+          <THead>
+            <Tr>
+              <Th>{S.members.userLabel}</Th>
+              <Th>{S.members.roleLabel}</Th>
+              <Th>{S.members.statusLabel}</Th>
+              <Th />
+            </Tr>
+          </THead>
+          <TBody>
+            {pagedMembers.map((m) => (
+              <Tr
+                key={m.user_id}
+                // group：行尾那个 ⋯ 靠它认出「指针停在这一行」（见 REVEAL）
+                className={cn("group", m.deactivated && "opacity-55")}
+              >
+                <Td>
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-body text-ink">{m.display_name}</span>
+                    {m.is_admin && <Chip tone="info">{S.members.systemAdmin}</Chip>}
+                  </div>
+                  <div className="truncate text-small text-ink-2">{m.email}</div>
+                </Td>
+                <Td className="text-ink-2">
+                  {/* **就是一个词。**改角色搬进行尾那个菜单了——这一列是名单在
+                      陈述事实，不是一排等着填的控件 */}
+                  {m.deactivated
+                    ? "—"
+                    : (S.members.roles[m.role as keyof typeof S.members.roles] ??
+                      m.role)}
+                </Td>
+                <Td>
+                  {m.deactivated ? (
+                    <Chip tone="danger">{S.members.filterDeactivated}</Chip>
+                  ) : (
+                    <span className="text-small text-ink-2">{S.members.filterActive}</span>
+                  )}
+                </Td>
+                {/* **一行的动作收进行尾那支铅笔**：指针停在这一行才现身
+                    （`REVEAL`），点开是一张居中的弹窗，改角色、停用、移出都在
+                    那里面。从前是两三个常驻的红字摊在行尾，十行就是二十个，
+                    一屏最扎眼的成了「移出」和「停用」——而人来这一页十次有九次
+                    只是看看谁在里面。 */}
+                <Td className="text-right">
+                  {/* 停用的账号没有工作区角色，也就没什么可编辑的：它这一行
+                      只有一件事可做，那就直接摆出来，不必藏进弹窗 */}
+                  {m.deactivated ? (
+                    <Button variant="secondary" size="sm"
+                      disabled={revive.isPending}
+                      onClick={() => revive.mutate(m.user_id)}
+                    >
+                      {S.members.reactivate}
+                    </Button>
+                  ) : (
+                    <IconButton
+                      size="sm"
+                      label={S.members.editMember}
+                      className={REVEAL}
+                      onClick={() => setEditing(m)}
+                    >
+                      <Pencil size={13} />
+                    </IconButton>
+                  )}
+                </Td>
+              </Tr>
+            ))}
+          </TBody>
+        </Table>
+        {memberList.length === 0 && (
+          <p className="px-4 py-6 text-body text-ink-2">{S.ui.noMatches}</p>
+        )}
+      </div>
+      <Pager
+        total={memberList.length}
+        pageSize={MEMBER_PAGE}
+        page={safeMemberPage}
+        onPage={setMemberPage}
+      />
+
+      {/* 把一个**已有账号**加进这个工作区。与「开账号」是两件事：那个凭空造
+          一个人，这个只是给已经存在的人一个角色 */}
+      <Dialog
+        open={adding}
+        onOpenChange={setAdding}
+        title={S.members.addExisting}
+        closeLabel={S.ui.close}
+        footer={
+          <>
+            <Button variant="secondary" size="sm" onClick={() => setAdding(false)}>
+              {S.members.cancel}
+            </Button>
+            <Button variant="primary" size="sm"
+              disabled={!addUserId || setRole_.isPending}
+              onClick={() => {
+                setRole_.mutate({ userId: addUserId, role: addRole });
+                setAdding(false);
+              }}
+            >
+              {S.members.add}
+            </Button>
+          </>
+        }
+      >
+        <div className="grid grid-cols-2 gap-3">
+          <Field label={S.members.userLabel} className="mb-0">
+            {/* 空列表由 SearchSelect 自己说（它有 noMatches 空态） */}
+            <SearchSelect
+              className="w-full"
+              value={addUserId}
+              onChange={setAddUserId}
+              placeholder={S.members.pickUser}
+              options={addable.map((u) => ({
+                value: u.id,
+                label: u.display_name,
+                hint: u.email,
+              }))}
+            />
+          </Field>
+          <Field label={S.members.roleLabel} className="mb-0">
+            <Dropdown
+              className="w-full"
+              value={addRole}
+              onChange={setAddRole}
+              options={ROLE_OPTIONS}
+            />
+          </Field>
+        </div>
+      </Dialog>
+
+      {me.data?.is_admin && (
+        <CreateUserDialog
+          open={creating}
+          onOpenChange={setCreating}
+          onCreated={() => {
+            setCreating(false);
+            refresh();
           }}
         />
-      </div>
-
-      {error && <p className="mb-3 text-sm text-rose-400">{error}</p>}
-
-      <table className="w-full text-sm">
-        <tbody>
-          {pagedMembers.map((m) => (
-            <tr key={m.user_id} className="border-b border-white/5">
-              <td className="py-2 pr-3">
-                <div className="text-neutral-200">
-                  {m.display_name}
-                  {m.is_admin && (
-                    <span className="ml-1.5 rounded bg-[rgba(74,163,255,0.12)] px-1.5 py-0.5 text-[10px] text-[var(--u-accent)]">
-                      {S.members.systemAdmin}
-                    </span>
-                  )}
-                </div>
-                <div className="text-xs text-neutral-500">{m.email}</div>
-              </td>
-              <td className="py-2 pr-3 text-right">
-                <Dropdown
-                  size="sm"
-                  className="w-24 ml-auto"
-                  value={m.role}
-                  onChange={(role) => setRole.mutate({ userId: m.user_id, role })}
-                  options={ROLE_OPTIONS}
-                />
-              </td>
-              <td className="py-2 text-right whitespace-nowrap">
-                <button
-                  onClick={() => remove.mutate(m.user_id)}
-                  className="text-xs text-neutral-500 hover:text-rose-400"
-                >
-                  {S.members.remove}
-                </button>
-                {/* 停用账号跟「移出工作区」是两件事：前者断掉整个系统的访问，
-                    后者只是这个工作区不再有他。所以分开两个按钮，而且停用
-                    只给管理员看——它的影响面大得多 */}
-                {me.data?.is_admin && me.data.id !== m.user_id && (
-                  <button
-                    onClick={() => {
-                      if (confirm(S.members.deactivateConfirm(m.display_name)))
-                        deactivate.mutate(m.user_id);
-                    }}
-                    className="ml-3 text-xs text-neutral-600 hover:text-rose-400"
-                    title={S.members.deactivateHint}
-                  >
-                    {S.members.deactivate}
-                  </button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div className="mb-4">
-        <Pager
-          total={memberList.length}
-          pageSize={MEMBER_PAGE}
-          page={safeMemberPage}
-          onPage={setMemberPage}
+      )}
+      {editing && (
+        <MemberDialog
+          member={editing}
+          canDeactivate={!!me.data?.is_admin && me.data.id !== editing.user_id}
+          canSetAdmin={!!me.data?.is_admin}
+          isSelf={me.data?.id === editing.user_id}
+          busy={setRole_.isPending || setSystemAdmin.isPending || remove.isPending}
+          onSave={({ role, is_admin }) => {
+            if (role !== undefined) setRole_.mutate({ userId: editing.user_id, role });
+            if (is_admin !== undefined)
+              setSystemAdmin.mutate({ userId: editing.user_id, isAdmin: is_admin });
+            setEditing(null);
+          }}
+          onDeactivate={() => {
+            setDeactivating({ id: editing.user_id, name: editing.display_name });
+            setEditing(null);
+          }}
+          onRemove={() => {
+            remove.mutate(editing.user_id);
+            setEditing(null);
+          }}
+          onClose={() => setEditing(null)}
         />
-      </div>
+      )}
 
-      {/* picker 常驻。理由同 KbSettings 里那段：控件消失读作"坏了"，
-          而不是"没人可加"；空列表 SearchSelect 自己会说 */}
-      <div className="flex gap-2 items-center">
-          <SearchSelect
-            className="flex-1"
-            value={addUserId}
-            onChange={setAddUserId}
-            placeholder={S.members.pickUser}
-            options={addable.map((u) => ({
-              value: u.id,
-              label: u.display_name,
-              hint: u.email,
-            }))}
-          />
-          <Dropdown
-            className="w-28"
-            value={addRole}
-            onChange={setAddRole}
-            options={ROLE_OPTIONS}
-          />
-          <button
-            onClick={() => addUserId && setRole.mutate({ userId: addUserId, role: addRole })}
-            disabled={!addUserId}
-            className="u-btn u-btn-primary px-3 py-1.5 text-sm"
-          >
-            {S.members.add}
-          </button>
-      </div>
-
-      {me.data?.is_admin && <CreateUser onCreated={refresh} />}
-      {me.data?.is_admin && <DeactivatedUsers onChanged={refresh} />}
+      {deactivating && (
+        <DangerConfirm
+          title={S.members.deactivate}
+          hint={S.members.deactivateConfirm(deactivating.name)}
+          confirmLabel={S.members.deactivate}
+          cancelLabel={S.members.cancel}
+          busy={deactivate.isPending}
+          onConfirm={() => {
+            deactivate.mutate(deactivating.id);
+            setDeactivating(null);
+          }}
+          onCancel={() => setDeactivating(null)}
+        />
+      )}
     </div>
   );
 }
 
-
-/** 已停用的账号，以及恢复它们。
- *
- * **这一块存在的理由是「否则恢复够不着」**：停用之后那个人从成员表、选人器、
- * 每一个列表里消失，管理员拿不到他的 id，而恢复接口要的正是那个 id。
- *
- * 一个都没有时整块不出现——没有停用过的部署不该看到一个永远空的区块。
- */
-function DeactivatedUsers({ onChanged }: { onChanged: () => void }) {
-  const list = useQuery({
-    queryKey: ["deactivatedUsers"],
-    queryFn: api.deactivatedUsers,
-  });
-  const queryClient = useQueryClient();
-  const revive = useMutation({
-    mutationFn: (userId: string) => api.adminReactivateUser(userId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["deactivatedUsers"] });
-      onChanged();
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  const users = list.data ?? [];
-  if (users.length === 0) return null;
-
-  return (
-    <div className="mt-6">
-      <h4 className="text-[13px] text-neutral-300">
-        {S.members.deactivatedTitle}
-      </h4>
-      <p className="mt-0.5 text-[11px] leading-relaxed text-neutral-500">
-        {S.members.deactivatedHint}
-      </p>
-      <div className="mt-2 space-y-1">
-        {users.map((u) => (
-          <div
-            key={u.id}
-            className="flex items-center gap-2 rounded border border-white/10 px-2.5 py-1.5"
-          >
-            <span className="text-[13px] text-neutral-300">
-              {u.display_name}
-            </span>
-            <span className="text-[11px] text-neutral-600">{u.email}</span>
-            <button
-              className="ml-auto u-btn u-btn-ghost px-2 py-0.5 text-xs"
-              disabled={revive.isPending}
-              onClick={() => revive.mutate(u.id)}
-            >
-              {S.members.reactivate}
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-/** 管理员代开账号（注册关闭后的唯一入口）。 */
-function CreateUser({ onCreated }: { onCreated: () => void }) {
+/** 管理员代开账号（注册关闭后的唯一入口）。开账号是个动作，住在弹窗里 */
+function CreateUserDialog({
+  open,
+  onOpenChange,
+  onCreated,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onCreated: () => void;
+}) {
   const queryClient = useQueryClient();
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
@@ -251,48 +497,67 @@ function CreateUser({ onCreated }: { onCreated: () => void }) {
   const valid = email.includes("@") && name.trim() && password.length >= 8;
 
   return (
-    <div className="mt-5 border-t border-white/10 pt-4">
-      <h4 className="text-xs font-bold text-neutral-400 mb-2">{S.settings.newUser}</h4>
-      <div className="grid grid-cols-2 gap-2 mb-2">
-        <input
-          className="input-dark px-3 py-2 text-sm"
-          placeholder={S.login.email}
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
-        <input
-          className="input-dark px-3 py-2 text-sm"
-          placeholder={S.login.displayName}
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-        <input
-          className="input-dark px-3 py-2 text-sm"
-          type="password"
-          placeholder={S.settings.initialPassword}
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-        <Dropdown
-          value={role}
-          onChange={setRole}
-          options={[
-            { value: "admin", label: S.members.roles.admin },
-            { value: "editor", label: S.members.roles.editor },
-            { value: "viewer", label: S.members.roles.viewer },
-          ]}
-        />
+    <Dialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={S.settings.newUser}
+      closeLabel={S.ui.close}
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={() => onOpenChange(false)}>
+            {S.members.cancel}
+          </Button>
+          <Button variant="primary" size="sm"
+            disabled={!valid || create.isPending}
+            onClick={() => create.mutate()}
+          >
+            {S.settings.createUserBtn}
+          </Button>
+        </>
+      }
+    >
+      {/* 这是**给别人开账号**，不是登录：浏览器看见「邮箱 + 密码」就把当前
+          登录的人填进来（管理员打开它，看到的是自己的名字和一串圆点）。
+          `new-password` 让 Chrome 认出这是设新密码而不是回填旧凭据，
+          上面两格一并关掉自动填充 */}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label={S.login.email} className="mb-0">
+          <Input className="w-full"
+            autoFocus
+            autoComplete="off"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </Field>
+        <Field label={S.login.displayName} className="mb-0">
+          <Input className="w-full"
+            autoComplete="off"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </Field>
+        <Field label={S.settings.initialPassword} className="mb-0">
+          <Input className="w-full"
+            type="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </Field>
+        <Field label={S.members.roleLabel} className="mb-0">
+          <Dropdown
+            className="w-full"
+            value={role}
+            onChange={setRole}
+            options={[
+              { value: "admin", label: S.members.roles.admin },
+              { value: "editor", label: S.members.roles.editor },
+              { value: "viewer", label: S.members.roles.viewer },
+            ]}
+          />
+        </Field>
       </div>
-      <div className="flex items-center gap-3">
-        <button
-          className="u-btn u-btn-primary px-3.5 py-1.5 text-xs"
-          disabled={!valid || create.isPending}
-          onClick={() => create.mutate()}
-        >
-          {S.settings.createUserBtn}
-        </button>
-        {error && <p className="text-xs text-rose-400">{error}</p>}
-      </div>
-    </div>
+      {error && <p className="mt-3 text-small text-danger">{error}</p>}
+    </Dialog>
   );
 }

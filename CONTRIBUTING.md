@@ -2,7 +2,7 @@
 
 [中文](CONTRIBUTING.zh-CN.md)
 
-Welcome. This file covers what is specific to this repository; general open-source etiquette is assumed.
+Welcome. This file covers what is specific to this repository; general open-source etiquette is assumed. How we treat each other is in the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Branches and how changes land
 
@@ -26,6 +26,7 @@ Merging `dev → main` is done by maintainers on their own schedule; contributor
 
 - **Back-merge `main` into `dev` right after a release.** The `dev → main` merge commit lives only on `main`, so without this `main` reads as ahead even though the trees are identical, and the gap grows by one every release.
 - **Urgent fixes go through `dev` too.** A PR opened straight against `main` is the one thing that makes the two branches genuinely diverge, and then someone has to reconcile them by hand.
+- **A release moves the compose pin.** `docker-compose.yml` defaults `UTOPIA_IMAGE` to a fixed tag, and that tag is what the README's one-command start actually runs. Cutting a release is: merge `dev → main`, tag and publish, then a PR on `dev` that points the pin at the new tag. rc6 and rc7 shipped with the pin still on rc5, so everyone who followed the README ran a three-week-old build. Tags from rc8 on are multi-arch, and the pin has been on one of them since rc8.
 
 Both branches are protected: pull request required, CI (`backend` and `web`) must pass, no force pushes, no deletions, and admins are held to the same rules.
 
@@ -42,6 +43,8 @@ Both branches are protected: pull request required, CI (`backend` and `web`) mus
 ## Local setup
 
 Requires Docker, Rust 1.85+, Node 20+, pnpm.
+
+PDF text extraction also uses `pdftotext` when the Rust parser cannot read a file. Source installs need Poppler and its CJK CMap data (`poppler-utils poppler-data` on Debian); the Docker image includes both. Without them the PDF fallback test skips, and a PDF that draws text we cannot read reports a reader failure rather than claiming the file is a scan.
 
 ```bash
 docker compose up -d db                 # Postgres with pgvector
@@ -65,24 +68,56 @@ cd web && pnpm install --frozen-lockfile && pnpm build   # build type-checks
 This is the easiest thing to get wrong here. A green `cargo test --workspace` does not mean everything ran. A number of tests begin like this:
 
 ```rust
-let Ok(url) = std::env::var("UTOPIA_DATABASE_URL") else {
-    eprintln!("skipping: UTOPIA_DATABASE_URL not set");
+let Some(url) = utopia_store::test_db::url() else {
     return Ok(());
 };
 ```
+
+`test_db::url()` reads `UTOPIA_DATABASE_URL`. With `UTOPIA_TEST_REQUIRE_DB=1` also set, a missing database is a failure rather than a skip — that is how the `migrations` job in CI runs the whole `utopia-store` suite, so a green run there means the SQL was exercised. Use the same guard in new tests; do not read the env var directly.
 
 They guard what the compiler cannot see: table aliases inside SQL strings, how `NULL` behaves in a comparison, rows an `INNER JOIN` silently drops, whether a recursive CTE expands the same ancestor twice under diamond inheritance. `cargo check` and clippy say nothing about any of it.
 
 If you touched SQL under `crates/utopia-store/`, set it and run again:
 
 ```bash
-export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:5432/utopia
+# 1517 is the host-side port: docker-compose.yml deliberately avoids 5432
+# so a locally installed Postgres does not collide with the dev container.
+# Inside the compose network the app still talks to db:5432; 1517 is only
+# for code on the host reaching the container.
+export UTOPIA_DATABASE_URL=postgres://utopia:utopia@localhost:1517/utopia
 cargo test --workspace
 ```
+
+### Human phrase delivery regressions
+
+`human_phrase_materialization_delivery` exercises the real store and kills child
+processes at three commit boundaries. It starts the actual queue worker, so run
+it **only against a dedicated, otherwise idle test database**, separately from the
+workspace suite. Busy-lock coverage calls the private materialization body from
+`cfg(test)` and observes the existing production entry point waiting on the lock.
+These tests do not register an asynchronous production handler.
+
+```bash
+export UTOPIA_DATABASE_URL=postgres://.../dedicated_delivery_tests
+export UTOPIA_TEST_REQUIRE_DB=1
+cargo test --locked -p utopia-store --test human_phrase_materialization_delivery -- --ignored --skip crash_child --test-threads=1 --nocapture
+cargo test --locked -p utopia-store --lib materialize::delivery_tests::busy_defers_without_retaining_connections -- --ignored --test-threads=1 --nocapture
+```
+
+The first command explicitly runs both parents; the process-exit parent invokes
+`crash_child` itself and kills and waits for each child. Do not run that child by
+hand. See [0051](docs/decisions/0051-a-human-phrase-decision-carries-its-materialization-work.md)
+for the proposed delivery contract and remaining production acceptance.
 
 ## Things review will send back
 
 **Don't collide migration numbers.** `migrations/` rolls forward by number. Check the latest number on `main` before opening a PR — two branches each writing an `0011_` has happened, and after the merge neither one runs.
+
+**Tests cover what the change introduces.** One test per behaviour the change adds or fixes, and it fails without the change. Do not prove again what the change leaves alone, and do not add a case for an input the code is never given. Tests several times the size of the code they cover will be asked to shrink.
+
+**A test has to run in CI.** CI runs `cargo test --workspace`, `pnpm test` and `scripts/bench/lib.test.mjs`, and nothing else. A test that is `#[ignore]`d, needs a database of its own, or lives in a script file CI does not run is exercised by no one after the day it was written. The delivery regressions above are the one exception, kept because they kill processes; another needs a reason of that kind, agreed in the issue first.
+
+**One pull request is one reviewable change.** A pull request that adds more than 500 lines of code and tests together explains in its description why it cannot be split. What was run to check it (machine, commit, counts) goes in the description too, not in a decision record.
 
 **UI strings go in i18n.** Add to both `web/src/i18n/en.ts` and `zh.ts`; no hard-coded strings in components.
 
@@ -110,7 +145,7 @@ Signed-off-by: Your Name <your@email>
 
 Forgot? `git commit --amend -s` for the last commit, or `git rebase --signoff HEAD~3` for several (adjust the count), then `git push -f`.
 
-Use a real name and a reachable email address.
+Use a consistent identity you answer to — a GitHub account with history under it counts — and an address that reaches you; a noreply address tied to that account is fine. No anonymous or throwaway contributions.
 
 ## License
 

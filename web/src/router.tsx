@@ -1,3 +1,5 @@
+import { ExpressionDraftLab } from "./pages/ExpressionDraftLab";
+import { docSearch } from "./quotes";
 import {
   createRootRoute,
   createRoute,
@@ -6,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import { Account } from "./pages/Account";
 import { AccountShell } from "./pages/AccountShell";
+import { Tokens } from "./pages/Tokens";
 import { Chat } from "./pages/Chat";
 import { DocViewer } from "./pages/DocViewer";
 import { DocsPage } from "./pages/Docs";
@@ -87,6 +90,11 @@ const searchRoute = createRoute({
   getParentRoute: () => kbRoute,
   path: "search",
   component: Search,
+  // 搜索词是「你在看什么」，不是「你怎么看」——刷新、返回、分享都靠它重建
+  // （同 doc 的 chunk、review 的 queue）。分页留在本地，同图谱的档位
+  validateSearch: (search: Record<string, unknown>): { q?: string } => ({
+    q: typeof search.q === "string" ? search.q : undefined,
+  }),
 });
 
 const graphRoute = createRoute({
@@ -112,9 +120,7 @@ const graphRoute = createRoute({
 const docRoute = createRoute({
   getParentRoute: () => kbRoute,
   path: "doc/$docId",
-  validateSearch: (search: Record<string, unknown>): { chunk?: string } => ({
-    chunk: typeof search.chunk === "string" ? search.chunk : undefined,
-  }),
+  validateSearch: docSearch,
   component: DocViewer,
 });
 
@@ -125,6 +131,13 @@ const libraryRoute = createRoute({
     src: typeof search.src === "string" ? search.src : undefined,
   }),
   component: Library,
+});
+
+// Unlisted opt-in exploration: authenticated reads, local drafts, no persistence.
+const expressionDraftRoute = createRoute({
+  getParentRoute: () => kbRoute,
+  path: "expression-draft",
+  component: ExpressionDraftLab,
 });
 
 const ontologyRoute = createRoute({
@@ -142,6 +155,13 @@ const mappingsRoute = createRoute({
 const reviewRoute = createRoute({
   getParentRoute: () => kbRoute,
   path: "review",
+  // 从实体面板的争议 chip 跳过来：落到对应那一档，并点亮那一张卡（0017 §3）
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { queue?: string; item?: string } => ({
+    queue: typeof search.queue === "string" ? search.queue : undefined,
+    item: typeof search.item === "string" ? search.item : undefined,
+  }),
   component: Review,
 });
 
@@ -176,7 +196,18 @@ const accountRoute = createRoute({
 const myKbsRoute = createRoute({
   getParentRoute: () => accountShellRoute,
   path: "/account/kbs",
+  // 建库的入口在别处（顶栏的库切换器最后一行），带着这个参数落地就直接开表单
+  validateSearch: (search: Record<string, unknown>): { create?: true } => ({
+    create: search.create === true || search.create === "true" ? true : undefined,
+  }),
   component: MyKbs,
+});
+
+// 个人令牌（0014）：给 agent 的钥匙属于人，所以在账户层，不在库里
+const tokensRoute = createRoute({
+  getParentRoute: () => accountShellRoute,
+  path: "/account/tokens",
+  component: Tokens,
 });
 
 const adminRoute = createRoute({
@@ -185,12 +216,12 @@ const adminRoute = createRoute({
   // 深链指定页签（如 KB 数据节的"注册新连接"直达 Data sources）
   validateSearch: (
     search: Record<string, unknown>,
-  ): { tab?: "models" | "members" | "kbs" | "datasources" | "deployment" } => ({
+  ): { tab?: "models" | "members" | "datasources" | "sso" | "deployment" } => ({
     tab:
       search.tab === "models" ||
       search.tab === "members" ||
-      search.tab === "kbs" ||
       search.tab === "datasources" ||
+      search.tab === "sso" ||
       search.tab === "deployment"
         ? search.tab
         : undefined,
@@ -266,7 +297,7 @@ const routeTree = rootRoute.addChildren([
   settingsRoute,
   docsIndexRoute,
   docsRoute,
-  accountShellRoute.addChildren([accountRoute, myKbsRoute, adminRoute]),
+  accountShellRoute.addChildren([accountRoute, myKbsRoute, tokensRoute, adminRoute]),
   appRoute.addChildren([
     indexRoute,
     legacyGraphRoute,
@@ -285,6 +316,7 @@ const routeTree = rootRoute.addChildren([
       libraryRoute,
       reviewRoute,
       ontologyRoute,
+      expressionDraftRoute,
       mappingsRoute,
       kbSettingsRoute,
     ]),

@@ -13,6 +13,7 @@ data/
 # 必须写成 /docs/* 而非 /docs——父目录被忽略时，子路径无法用 ! 重新纳入。
 /docs/*
 !/docs/decisions/
+!/docs/design/
 !/docs/pipeline.md
 .claude/
 
@@ -35,3 +36,6 @@ _*.txt
 # 命令写进跑测记录，语料本身不进仓库。
 /scripts/bench/corpora/wiki-*-subset.json
 /scripts/bench/corpora/wiki-nov2023.json
+/scripts/bench/corpora/contracts/edgar/
+/scripts/bench/corpora/contracts/cuad/
+/scripts/bench/corpora/contracts/lease-kb-*.json
