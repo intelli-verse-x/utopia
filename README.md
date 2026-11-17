@@ -20,6 +20,8 @@
 [![Built by DeepLethe](https://img.shields.io/badge/BUILT%20BY-DEEPLETHE-2D333B?style=flat-square&labelColor=161B22)](https://github.com/deeplethe)
 [![中文](https://img.shields.io/badge/LANG-%E4%B8%AD%E6%96%87-DA3633?style=flat-square&labelColor=161B22)](README.zh-CN.md)
 
+<a href="https://trendshift.io/repositories/159739?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-159739" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/159739/daily?language=Python" alt="deeplethe%2Futopia | Trendshift" width="250" height="55"/></a>  <a href="https://trendshift.io/repositories/159739?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-159739" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/159739/weekly?language=Python&v=2" alt="deeplethe%2Futopia | Trendshift" width="250" height="55"/></a>
+
 </div>
 
 **The enterprise world model built by [DeepLethe](https://deeplethe.com).** It is the first open substrate for knowledge engineering that learns passively and governs itself. Where a knowledge graph or a vector store works to hold present knowledge, Utopia puts time awareness and ontology in the base layer: the knowledge system evolves as material arrives, and conflict detection, reasoning and decision making all run against that ontology. It deploys offline, so a company can stand up a knowledge foundation, a decision core its agents can trust, and a compliance audit trail on hardware it controls.
@@ -46,29 +48,46 @@ We gave it a somewhat romantic name, **Utopia**. Ptolemy's geocentric model was 
 
 Where existing vector stores and knowledge graphs work to get present knowledge right, one of Utopia's founding aims is to record the whole course of changing understanding. Engineered, that becomes a **bitemporal knowledge graph**. When a decision is reviewed later, the system can produce the full course it took and the grounds it rested on. To make this hold up in practice we have iterated at length against public corpora spanning enterprise records, education, finance, law and research. Temporality is only one facet; for how knowledge is taken in, how the future is reasoned about, and how logic bounds action, see [utopia.bi/philosophy](https://utopia.bi/philosophy).
 
+## Use cases
+
+What Utopia is for, in the shape of the question someone brings. Each is available today unless it says otherwise; each needs a chat model configured, and each leaves the doubtful cases to a person in Review.
+
+| Who and what | Input | Question, and what comes back | What the base adds over search or RAG |
+|---|---|---|---|
+| **A contract chain.** Legal or procurement, a master agreement amended several times. | The agreement and its amendments, as PDF or Word. | *Which payment terms applied on 15 March 2024, and who were the parties?* The terms in force on that date, the amendment they came from, the sentence. | Each fact carries when it held and where it was said; a later amendment closes the earlier term instead of overwriting it. The [contracts corpus](scripts/bench/corpora/contracts/README.md) is this scenario, with the questions it has to answer. |
+| **Who held what, when.** HR, finance or research records that change: handovers, corrections, restatements. | Announcements, minutes, filings, dated as they were written. | *Who led project X in Q2 2023, and what did we believe about it at the time?* The holder for that period, and separately what the base knew then. | Two clocks: when something was true, and when the base learned it. A correction links to what it replaced. The [temporal QA bench](scripts/bench/README.md) measures this. |
+| **An agent that reads the base.** Engineering or operations teams with Claude Desktop, Cursor or their own agent. | An existing base; the agent connects over MCP with a token scoped to it. | *Facts about this entity as of a date; the path between two things; what changed last week.* Structured answers with stable identifiers and evidence; anything the agent wants to record goes to a person first. | Reads are typed and dated, not passages; writes are proposals. The [MCP guide](web/src/docs/mcp.md) lists the tools. |
+| **Observations from a system.** Robotics, monitoring, security tooling: a system that already knows what it saw and when. | One push per observation, in the extraction contract itself, with the observation's time. New in rc7. | *Where was this object at 08:05, and where is it now?* The value that held at that moment and the observation it rests on. | No model between the system and the graph; a functional attribute closes its earlier value when a later observation arrives. The [walkthrough](docs/walkthrough.md) runs this end to end with `curl`. |
+
+The walkthrough is the shortest way to see the whole path: sample data, ingestion, a question, the answer with its evidence, and what the base does not do.
+
 ## Features
 
-The system is a Rust binary and a Postgres service. pgvector and a queue-table design keep the stack and its service dependencies light.
+One Rust binary and one Postgres. Full-text search is embedded in the binary, vectors go in pgvector, and the job queue is a table: nothing else to run.
 
 | | |
 |---|---|
-| **A complete application** | A system console, a graph browser and an ontology workbench that runs in the browser. Install it and it works; there is no library to assemble first. |
-| **Knowledge ingest** | PDF, DOCX, PPTX, XLSX/XLS/ODS, CSV/TSV, Markdown, HTML and plain text, with legacy text encodings detected on the way in. Web pages, RSS, GitHub and Jira sync on a cron; anything else pushes in with a per-source token. Failed parses reprocess in place, and a whole source or base can be re-extracted in bulk. |
-| **Search and chat** | Hybrid retrieval over Tantivy full-text and pgvector, fused with RRF; Chinese full-text uses jieba tokenisation. Answers stream with inline citations that jump straight to the source passage. Any OpenAI-compatible endpoint works (DeepSeek, Qwen, GLM, Ollama, vLLM), so the whole system can run on an isolated network. |
-| **Agent harness and agentic RAG** | The application is itself a harness: the whole system can be driven through conversation. The built-in agent carries tools for document search, entity lookup, fact and change history, and querying a mounted database, and calls them over several turns before it answers. |
-| **Ontology and cold start** | A base ships with no vocabulary of its own. Cold start comes from packs: schema.org, W3C Org, PROV-O, FOAF and IOF Core, gzipped into the binary and chosen at creation ([ask for your industry](https://github.com/deeplethe/utopia/issues/new?labels=enhancement&title=Ontology%20pack%20request)). Vocabulary met outside them is recorded with a source quote and a count, and frequent items merge in on confirmation, so the ontology grows with the corpus. |
-| **Bitemporal graph** | Extraction against the editable ontology produces entities and facts, each carrying a validity interval and its evidence rows. Correcting a fact closes the old version and links the new one to it rather than overwriting. Queries read back at any point in history, and the entity panel shows both timelines at once: when something held in the world, and when the system changed its mind. |
-| **Entity resolution and review** | Three-stage entity resolution; every merge is logged and can be undone. Low-confidence extractions, merge candidates and cardinality conflicts go to a review queue rather than interrupting anyone. Confirming, rejecting or closing a fact by hand leaves a record. |
-| **Reasoning and derivation** | Rules are expressed in temporal Datalog and driven by forward chaining. Derived facts carry validity and provenance like extracted ones, and their derivation path expands all the way back to the original sentence. Ontology axioms (type inheritance, relation hierarchy, transitivity, symmetry, inverses, disjointness, cardinality) compile into rules and take part in reasoning. |
-| **Conflict detection** | Three checks, three different verdicts. Temporal conflicts resolve to closing the old fact, keeping both, or rejecting the new one. Axiom violations in the data (self-loop, asymmetry, transitive cycle, cardinality) resolve to retracting the fact, relaxing the axiom, or accepting both. Defects in the ontology itself come first, because violations computed on a self-contradictory ontology are noise. |
-| **Ontology-driven querying** | Register a Postgres connection once, mount it on a base, and chat queries documents and the database together. An exploration pass reads the mounted schema against the concepts already in the base and proposes mappings; the agent proposes, a person confirms. The method behind it ([Ontology2SQL](https://github.com/deeplethe/ontology2sql)) is state of the art on BIRD Mini-Dev for both SQLite and PostgreSQL ([submission](https://github.com/bird-bench/bird-bench.github.io/pull/218)). |
-| **Multi-user and permissions** | Permissions are scoped per knowledge base, each with its own members and roles. Open bases are readable by everyone in the deployment, restricted ones only by invited users. A deployment has one system administrator, the first account registered, and each base carries owner, admin, editor and viewer roles. |
-| **Decision ledger** | Confirming and rejecting facts, merging and reverting entities, rebuilding the graph: all of them leave a record with the operator, the time, and a snapshot of the object as it then stood. The record remains queryable after the object is invalidated or rebuilt. |
-| **[Decision intelligence (in development)](#roadmap)** | Recording decisions, replaying both the understanding and the course a decision took, and reasoning over overlaid scenarios. |
+| **A complete application** | A system console, a graph browser and an ontology workbench in one web UI. A product, not a library: install it and it works. |
+| **Knowledge ingest** | Upload PDF, DOCX, PPTX, XLSX, XLS, ODS, CSV, TSV, Markdown, HTML or plain text, with legacy encodings detected on the way in. Scans and images are read by a MinerU service or a Volcengine Ark vision model, recordings by a transcription model that labels speakers. Web pages, RSS, GitHub, Jira, Notion, WebDAV and S3-compatible buckets sync on a schedule; everything else comes in through the API. |
+| **Search and chat** | Full-text on Tantivy, vectors on pgvector, fused with RRF. Answers stream with inline citations that open the passage they came from. Any OpenAI-compatible endpoint works (DeepSeek, Qwen, GLM, Ollama, vLLM), so the whole system can run air-gapped. |
+| **Agent harness and agentic RAG** | The whole system can be driven through conversation. The built-in agent searches documents, walks the graph (an entity's facts as of any date, or what changed in a period) and queries a mounted database. The same read-only tools are exposed over MCP. |
+| **Agents over MCP** | An MCP server for every knowledge base, so Claude Desktop, Cursor, Workbuddy and other agent frameworks can connect, with fine-grained permissions. |
+| **Ontology and cold start** | A new knowledge base has no vocabulary of its own; it starts from the packs you pick at creation. Five ship inside the binary: schema.org, W3C Org, PROV-O, FOAF and IOF Core ([ask for your industry](https://github.com/deeplethe/utopia/issues/new?labels=enhancement&title=Ontology%20pack%20request)). Terms outside the packs are counted as they appear; confirm the common ones and they join the ontology. |
+| **Bitemporal graph** | Extraction turns documents into entities and facts, following an ontology you can edit. Every fact carries when it held and where it came from. Correcting a fact closes the old version and links the new one to it rather than overwriting, so the graph keeps two timelines: when something was true in the world, and when the system came to believe it. Edges are reified, so an edge carries attributes of its own. |
+| **Entity resolution and review** | Duplicates are resolved in three stages: exact name or alias, embedding similarity, then a model's call on the doubtful pairs. Every merge can be undone. Uncertain cases go to a review queue: low-confidence extractions, suspected duplicates and cardinality conflicts. |
+| **Agent adjudication** | The agent adjudicates on its own, from common sense and the business documents. Low-confidence calls go to the human review queue, and the decisions people make there are recorded and used to tune the agent, closing the loop. |
+| **Reasoning and derivation** | Ontology axioms compile into rules: transitivity, symmetry, inverses and relation hierarchy derive new facts by forward chaining. Derivation is off by default, since a wrong axiom derives wrong facts. A derived fact is marked as such on the graph, carries validity and confidence like any other, and shows what it was derived from. When it contradicts an asserted fact, the asserted one stands. |
+| **Conflict detection** | Three kinds of conflict, three sets of choices. A new fact that clashes with an older one: close the old, keep both, or reject the new. Data that breaks an axiom (self-loop, asymmetry, transitive cycle, cardinality): retract the fact, relax the axiom, or accept both. The ontology itself is checked first, because violations of a self-contradictory ontology are noise. |
+| **Ontology-driven querying** | Mount a database on a base (Postgres, MySQL and the engines that speak its protocol, ClickHouse, Trino for Iceberg / Delta Lake / Hive, Databricks, Snowflake) and chat can query it alongside the documents. The agent proposes how its tables map onto the ontology, and you confirm. The method behind it, [Ontology2SQL](https://github.com/deeplethe/ontology2sql), is state of the art on BIRD Mini-Dev for SQLite and PostgreSQL ([submission](https://github.com/bird-bench/bird-bench.github.io/pull/218)). |
+| **Multi-user and permissions** | Each knowledge base has its own members and roles: owner, admin, editor and viewer. Open bases are readable by everyone in the deployment, restricted ones only by invitation. The first account registered becomes the system administrator. |
+| **Decision ledger** | Confirming or rejecting a fact, merging or reverting an entity, rebuilding the graph: each leaves a record of who, when, and what the object looked like at the time. The ledger is append-only, and a record outlives its object, even the base it belonged to. |
+| **[Decision intelligence (in development)](#roadmap)** | Record a decision, replay both what was understood and the course it took, and reason over overlaid scenarios. |
 
 ## Quick start
 
 Requirements: Docker (local development also needs Rust 1.85+, Node 20+, pnpm).
+
+The prebuilt image is published for `linux/amd64` and `linux/arm64`, so it runs natively on x86-64 hosts as well as Apple Silicon and AWS Graviton. Tags up to `0.1.0-rc7` are amd64 only.
 
 Start from the prebuilt image:
 
@@ -78,7 +97,9 @@ cd utopia
 docker compose --profile app up -d
 ```
 
-Open http://localhost:1516 and register. The first account automatically becomes the administrator, and a public knowledge base readable by everyone is created at the same time. Before extracting business documents, configure the model endpoints (chat and embedding) under system settings.
+Open http://localhost:1516 and register. The first account automatically becomes the administrator, and a public knowledge base readable by everyone is created at the same time. Before extracting business documents, configure the model endpoints (chat and embedding) under Administration → Models.
+
+The database password (`UTOPIA_DB_PASSWORD` in `.env`, default `utopia`) is applied when the data volume is first initialised. To change it on a running deployment, change it in the database as well — `docker compose exec db psql -U utopia -c "ALTER USER utopia PASSWORD '<new password>'"` — or start over with `docker compose --profile app down -v`, which deletes all data.
 
 Or build from source:
 
@@ -102,10 +123,10 @@ cd web && pnpm install && pnpm dev
 ## Roadmap
 
 - [ ] **Decision reasoning**: constraint computation, and replaying a decision after the fact
+- [ ] **Business rules**: rules written by people over an entity's attribute facts, a threshold or a category set, that classify it as a derived fact with the rule and the premises as its explanation ([#277](https://github.com/deeplethe/utopia/issues/277))
 - [ ] **Execution gate**: checking an agent's calls against ontology rules and symbolic logic
-- [ ] **Lakehouse for mapping and querying**: mapping exploration and Ontology2SQL over Iceberg / Delta Lake, Databricks, Snowflake and MaxCompute
-- [ ] **More sources**: MySQL, ClickHouse and Doris drivers; S3, WebDAV, Notion and Feishu connectors
-- [ ] **Time to the moment**: an `instant` precision beside year / month / day, for sources that carry a real timestamp. Today a connector rounds it to a UTC day, which can shift an event across midnight by one day
+- [ ] **MaxCompute**: mapping exploration and Ontology2SQL over Alibaba Cloud MaxCompute (Iceberg / Delta Lake via Trino, Databricks and Snowflake are in, awaiting a run against a real cluster)
+- [ ] **More sources**: a Feishu connector
 - [ ] **Agent memory over MCP**: episode writes, the retrieve endpoint, and the MCP server
 - [ ] **Enterprise**: OIDC SSO, backup and restore commands, benchmarks at 100k documents
 
@@ -128,9 +149,9 @@ Please read [SECURITY.md](SECURITY.md) before exposing it to the public internet
 
 ## Community
 
-- 💬 [Discussions](https://github.com/deeplethe/utopia/discussions): discussion, experience reports and reviews
-- 🐛 [Issues](https://github.com/deeplethe/utopia/issues): any bug, design question or request
-- 🤝 [Contributing](CONTRIBUTING.md): dev setup, the checks to run before pushing, DCO sign-off
+- 💬 [Discussions](https://github.com/deeplethe/utopia/discussions): discuss the project, share your experience, and leave feedback
+- 🐛 [Issues](https://github.com/deeplethe/utopia/issues): report bugs, ask design questions, and submit feature requests
+- 🤝 [Contributing](CONTRIBUTING.md): development setup, pre-push checks, and DCO sign-off
 - 🔌 [Ontology2SQL](https://github.com/deeplethe/ontology2sql): the ontology-driven text-to-SQL method referenced above
 
 ## License

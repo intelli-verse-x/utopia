@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 
 /* lucide 已移除品牌图标，GitHub mark 内联（官方 mark 路径，fill=currentColor） */
@@ -18,9 +18,16 @@ function GithubMark({ size = 16 }: { size?: number }) {
 }
 import { api, ApiError } from "../api";
 import { S } from "../i18n";
-import { Wordmark } from "../ui";
+import {
+  Button,
+  Input,
+  Segmented,
+  Wordmark,
+} from "../ui";
 import { LoginScene } from "./LoginScene";
+import { loginSections, ssoErrorKey } from "./loginSections";
 import { usePageTitle } from "../useTitle";
+import { claimFor } from "../authSession";
 
 export function Login() {
   usePageTitle(S.app.name, S.login.signIn);
@@ -30,13 +37,23 @@ export function Login() {
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [leaving, setLeaving] = useState(false);
+  const queryClient = useQueryClient();
+  const sso = useQuery({ queryKey: ["oidc-status"], queryFn: api.oidcStatus });
+  const sections = loginSections(sso.data);
+  // 单点登录回调失败时带着代码跳回这里（`?sso_error=`），措辞按代码查
+  const ssoError = new URLSearchParams(window.location.search).get("sso_error");
 
   const mutation = useMutation({
     mutationFn: async () => {
       if (mode === "login") return api.login(email, password);
       return api.register(email, password, displayName);
     },
-    onSuccess: () => {
+    onSuccess: ({ user }) => {
+      // 换人先清缓存：`me`、`workspaces` 这些一次会话内不过期（queryDefaults.ts），
+      // 会话过期后同一标签页登另一个账号，不清就看见上一个人的名字和库
+      queryClient.clear();
+      // 缓存外的草稿、上次会话和回答只在换了人时清：同一个人重新登录，它们还在（authSession.ts）
+      claimFor(user.id);
       // 谢幕：卡片上浮淡出、巨构放大穿越，再进入图谱首页
       setLeaving(true);
       window.setTimeout(() => navigate({ to: "/" }), 650);
@@ -50,7 +67,6 @@ export function Login() {
         ? S.login.networkError
         : null;
 
-  const input = "input-dark w-full px-3 py-2 text-sm";
 
   return (
     <div className="min-h-screen flex items-center justify-center px-4">
@@ -60,36 +76,39 @@ export function Login() {
         className={`relative z-10 w-full max-w-sm ${leaving ? "u-depart" : ""}`}
       >
         <div className="mb-8 text-center u-rise">
-          <h1 className="text-5xl font-normal">
+          <h1 className="u-wordmark-hero font-normal">
             <Wordmark />
           </h1>
-          <p className="mt-2 text-sm text-neutral-400">
+          <p className="mt-2 text-body text-ink-2">
             {S.app.tagline}
-            <span className="ml-2 text-[11px]">{S.app.taglineSource}</span>
+            <span className="ml-2 text-fine">{S.app.taglineSource}</span>
           </p>
         </div>
 
         <div
-          className="u-card-opaque rounded-2xl p-6 u-rise"
+          className="u-card-opaque rounded-panel p-6 u-rise"
           style={{ animationDelay: "90ms" }}
         >
-          <div className="flex gap-1 mb-5 bg-white/5 rounded-lg p-1">
-            {(["login", "register"] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMode(m)}
-                className={`flex-1 rounded-md py-1.5 text-sm font-medium transition-colors ${
-                  mode === m
-                    ? "bg-white/10 text-neutral-100"
-                    : "text-neutral-500 hover:text-neutral-300"
-                }`}
-              >
-                {m === "login" ? S.login.signIn : S.login.signUp}
-              </button>
-            ))}
-          </div>
+          {sections.password && (
+          <Segmented
+            fill
+            className="mb-6"
+            value={mode}
+            onChange={setMode}
+            options={(["login", "register"] as const).map((m) => ({
+              value: m,
+              label: m === "login" ? S.login.signIn : S.login.signUp,
+            }))}
+          />
+          )}
 
+          {ssoError && (
+            <p role="alert" className="mb-3 text-small text-danger">
+              {S.login.ssoErrors[ssoErrorKey(ssoError, sections.password)] ?? S.login.ssoErrorOther}
+            </p>
+          )}
+
+          {sections.password && (
           <form
             className="space-y-3"
             onSubmit={(e) => {
@@ -98,44 +117,64 @@ export function Login() {
             }}
           >
             {mode === "register" && (
-              <input
-                className={input}
+              <Input
+                className="w-full"
                 placeholder={S.login.displayName}
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 required
               />
             )}
-            <input
+            <Input
               type="email"
-              className={input}
+              className="w-full"
               placeholder={S.login.email}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
             />
-            <input
+            <Input
               type="password"
-              className={input}
+              className="w-full"
               placeholder={S.login.password}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
               minLength={8}
             />
-            {error && <p className="text-sm text-rose-400">{error}</p>}
-            <button
+            {error && <p className="text-body text-danger">{error}</p>}
+            <Button variant="primary" size="md" className="w-full"
               type="submit"
               disabled={mutation.isPending || leaving}
-              className="btn-primary w-full py-2 text-sm"
             >
               {mutation.isPending || leaving
                 ? S.login.submitting
                 : mode === "login"
                   ? S.login.signIn
                   : S.login.createAccount}
-            </button>
+            </Button>
           </form>
+          )}
+
+          {mode === "login" && sections.sso && (
+            <>
+              {sections.password && (
+                <div className="my-4 flex items-center gap-3 text-fine text-ink-2">
+                  <span className="h-px flex-1 bg-line" />
+                  {S.login.orDivider}
+                  <span className="h-px flex-1 bg-line" />
+                </div>
+              )}
+              <Button variant="secondary" size="md" className="w-full"
+                disabled={leaving}
+                onClick={() => {
+                  window.location.href = "/api/v1/auth/oidc/start";
+                }}
+              >
+                {S.login.ssoButton}
+              </Button>
+            </>
+          )}
         </div>
 
         {/* 页脚：惯用同意句式内嵌条款/隐私链接 + GitHub 入口 */}
@@ -143,18 +182,18 @@ export function Login() {
           className="mt-6 text-center u-rise"
           style={{ animationDelay: "180ms" }}
         >
-          <p className="u-balance text-[11px] leading-relaxed text-neutral-600">
+          <p className="u-balance text-fine leading-relaxed text-ink-2">
             {S.login.agreePrefix}
             <Link
               to="/terms"
-              className="whitespace-nowrap text-neutral-500 underline decoration-white/20 underline-offset-2 hover:text-neutral-300 transition-colors"
+              className="u-link whitespace-nowrap"
             >
               {S.legal.termsTitle}
             </Link>
             {S.login.agreeAnd}
             <Link
               to="/privacy"
-              className="whitespace-nowrap text-neutral-500 underline decoration-white/20 underline-offset-2 hover:text-neutral-300 transition-colors"
+              className="u-link whitespace-nowrap"
             >
               {S.legal.privacyTitle}
             </Link>
@@ -165,7 +204,7 @@ export function Login() {
             target="_blank"
             rel="noreferrer"
             title="GitHub"
-            className="mt-3 inline-flex text-neutral-600 hover:text-neutral-300 transition-colors"
+            className="u-hover-ink mt-3 inline-flex text-ink-2"
           >
             <GithubMark size={16} />
           </a>

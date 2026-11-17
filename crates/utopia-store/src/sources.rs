@@ -2,28 +2,22 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use utopia_core::models::{Role, Source, SourceView, SyncRun};
-use utopia_core::{AppError, AppResult};
+use utopia_core::models::{Role, Source, SourceKind, SourceView, SyncRun, SOURCE_SECRET_KEYS};
+use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
 /// folder = 纯容器（上传/拖拽入内，无同步语义）；url/rss = 拉取型；api = 推送型。
 /// 本机目录监听（watch_folder）已否决——自部署用户看不到服务器磁盘；
-/// 未来的 watch 形态是对象存储/网盘（P5 连接器，与 BlobStore 接缝配套）。
+/// 对象存储 / WebDAV / Notion 是它的替代形态（0013）。
 /// custom = 自定义拉取器：任何实现 Utopia ingest 接口的 URL（返回 items JSON）即可定时摄取。
 /// github_issues / jira_issues = 工单：一张工单连同它的状态变更史成为一篇文档。
 ///
-/// **改这里就得改前端那份清单**（`Library.tsx` 的建来源对话框与 `api.ts` 的
-/// `SourceView["kind"]`）。两处对不上时的症状是：界面上选得到、建的时候报
-/// 「kind must be one of…」——单元测试与 tsc 都看不见，只有端到端会撞上。
-pub const KINDS: &[&str] = &[
-    "folder",
-    "url",
-    "rss",
-    "api",
-    "custom",
-    "github_issues",
-    "jira_issues",
-];
+/// 种类的清单**不在这里写**：`SourceKind`（utopia-core）一个枚举出全部——创建的白名单、
+/// 同步的分派、前端的下拉框（有测试对表）。从前这里有一张手写的 `KINDS`，五种连接器
+/// 加了同步却没进这张表，界面上选得到、建不出来（#247）
+pub fn creatable_kinds() -> Vec<&'static str> {
+    SourceKind::creatable().map(|k| k.as_str()).collect()
+}
 
 /// 校验并规范化标准 5 段 cron 表达式（内部用 cron crate 的 6 段：补秒位）。
 pub fn validate_cron(expr: &str) -> AppResult<String> {
@@ -43,6 +37,38 @@ pub fn validate_cron(expr: &str) -> AppResult<String> {
     Ok(normalized)
 }
 
+pub const RSS_CONTENT_MODE_KEY: &str = "content_mode";
+pub const RSS_FULL_CONTENT_MODE: &str = "full_new_items";
+
+/// RSS mode is deliberately a small enum in the persisted source config. Old
+/// rows without the key retain the legacy feed behavior.
+pub fn rss_content_mode(config: &serde_json::Value) -> AppResult<&'static str> {
+    let Some(value) = config.get(RSS_CONTENT_MODE_KEY) else {
+        return Ok("feed");
+    };
+    let Some(value) = value.as_str() else {
+        return Err(AppError::invalid(
+            "rss_content_mode_invalid",
+            "RSS content_mode must be feed or full_new_items",
+        ));
+    };
+    match value {
+        "feed" => Ok("feed"),
+        RSS_FULL_CONTENT_MODE => Ok(RSS_FULL_CONTENT_MODE),
+        _ => Err(AppError::invalid(
+            "rss_content_mode_invalid",
+            "RSS content_mode must be feed or full_new_items",
+        )),
+    }
+}
+
+pub fn rss_full_content_enabled(kind: &str, config: &serde_json::Value) -> AppResult<bool> {
+    if SourceKind::parse(kind) != Some(SourceKind::Rss) {
+        return Ok(false);
+    }
+    Ok(rss_content_mode(config)? == RSS_FULL_CONTENT_MODE)
+}
+
 /// cron 的下一次触发时刻（服务器本地时区）。
 fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     use std::str::FromStr;
@@ -55,28 +81,81 @@ fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
 }
 
 pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
-    // config 剔除 auth_header：自定义拉取器的凭据不下发给任何客户端
-    let rows: Vec<SourceView> = sqlx::query_as(
-        "SELECT s.id, s.kind, s.name, s.config - 'auth_header' AS config, s.icon,
-                s.sync_interval_minutes, s.sync_cron,
-                s.last_sync_at, s.last_sync_status, s.last_sync_error, s.last_sync_added,
-                (SELECT count(*) FROM documents d WHERE d.source_id = s.id) AS doc_count,
+    // config 剔掉凭据：列表给 Viewer 看，哪一种连接器的密钥都不下发。
+    // 键在 `SOURCE_SECRET_KEYS` 一张表上——从前这里只减 `auth_header`，五种连接器
+    // 的密钥就这么漏出去的（#246）
+    // 外层别名不能与 ENTRY_SELECT 的来源别名重名；来源和当前代谓词必须留在投影内部，
+    // 否则 PostgreSQL 会先计算部署中的全部 observation，再丢弃与当前来源无关的行。
+    let rows: Vec<SourceView> = sqlx::query_as(&format!(
+        "SELECT listed_source.id, listed_source.kind, listed_source.name,
+                listed_source.config - $2::text[] AS config, listed_source.icon,
+                listed_source.sync_interval_minutes, listed_source.sync_cron,
+                listed_source.last_sync_at, listed_source.last_sync_status,
+                listed_source.last_sync_error, listed_source.last_sync_added,
                 (SELECT count(*) FROM documents d
-                 WHERE d.source_id = s.id AND d.missing_since IS NOT NULL) AS missing_count
-         FROM sources s WHERE s.kb_id = $1 ORDER BY s.created_at",
-    )
+                 WHERE d.source_id = listed_source.id AND d.deleted_at IS NULL) AS doc_count,
+                (SELECT count(*) FROM documents d
+                 WHERE d.source_id = listed_source.id AND d.missing_since IS NOT NULL
+                   AND d.deleted_at IS NULL) AS missing_count,
+                -- 整块出去，不是八个平铺的列（0026 / #417）。**不是 RSS 的来源
+                -- 这一格就是 NULL**：从前「不适用」在 state 上写作 NULL、在五个
+                -- 计数上写作 0，同一件事两套说法，而 `queued_count: 0` 读起来
+                -- 像「队列空着」。计数在块里仍然 COALESCE 成 0——这时候它真是
+                -- 「这一档现在没有」，不是「不适用」。
+                CASE WHEN listed_source.kind = 'rss' THEN jsonb_build_object(
+                    'state', CASE
+                        WHEN listed_source.config->>'content_mode' IS DISTINCT FROM 'full_new_items'
+                            THEN 'disabled'
+                        WHEN listed_source.rss_baselined_at IS NULL THEN 'pending'
+                        ELSE 'active' END,
+                    'pending', COALESCE(hydration.pending, 0),
+                    'queued', COALESCE(hydration.queued, 0),
+                    'retrying', COALESCE(hydration.retrying, 0),
+                    'complete', COALESCE(hydration.complete, 0),
+                    'terminal', COALESCE(hydration.terminal, 0)
+                ) END AS rss_full_content
+         FROM sources listed_source
+         LEFT JOIN LATERAL (
+             SELECT
+                 (count(*) FILTER (WHERE projected.state = 'baseline'))::int AS baseline_count,
+                 count(*) FILTER (WHERE projected.state = 'pending') AS pending,
+                 count(*) FILTER (WHERE projected.state IN ('queued', 'hydrating')) AS queued,
+                 count(*) FILTER (WHERE projected.state = 'retry_wait') AS retrying,
+                 count(*) FILTER (WHERE projected.state = 'complete') AS complete,
+                 count(*) FILTER (
+                     WHERE projected.state IN ('terminal', 'deleted', 'superseded')
+                 ) AS terminal
+             FROM (
+                 {}
+                 WHERE listed_source.kind = 'rss'
+                   AND e.source_id = listed_source.id
+                   AND e.activation_generation = listed_source.rss_generation
+             ) projected
+         ) hydration ON listed_source.kind = 'rss'
+         WHERE listed_source.kb_id = $1 ORDER BY listed_source.created_at",
+        crate::rss_full_content::ENTRY_SELECT
+    ))
     .bind(kb_id)
+    .bind(SOURCE_SECRET_KEYS)
     .fetch_all(pool)
     .await?;
     Ok(rows)
 }
 
+/// 出库即开封：配置里的凭据键与推送密钥在库里是封印的（`utopia_core::secrets`）。
+/// 任何返回 `Source` 的查询都从这里过——`list` 不用，它在 SQL 里就把凭据键剔了
+fn opened(mut s: Source) -> AppResult<Source> {
+    secrets::open_json_keys(&mut s.config, SOURCE_SECRET_KEYS).map_err(AppError::Other)?;
+    s.ingest_token = secrets::open_opt(s.ingest_token.as_deref()).map_err(AppError::Other)?;
+    Ok(s)
+}
+
 pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Source> {
-    sqlx::query_as("SELECT * FROM sources WHERE id = $1")
+    let row: Option<Source> = sqlx::query_as("SELECT * FROM sources WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
-        .await?
-        .ok_or(AppError::NotFound)
+        .await?;
+    opened(row.ok_or(AppError::NotFound)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,10 +169,10 @@ pub async fn create(
     sync_interval_minutes: Option<i32>,
     sync_cron: Option<&str>,
 ) -> AppResult<Source> {
-    if !KINDS.contains(&kind) {
+    if !SourceKind::parse(kind).is_some_and(|k| k.creatable_by_hand()) {
         return Err(AppError::Validation(format!(
             "kind must be one of: {}",
-            KINDS.join(", ")
+            creatable_kinds().join(", ")
         )));
     }
     if name.trim().is_empty() {
@@ -110,16 +189,20 @@ pub async fn create(
         sync_interval_minutes
     };
     // serde 缺省的 Value::Null 会以 jsonb null 落库，前端读 config.x 直接炸——规范化为空对象
-    let config = if config.is_null() {
+    let mut config = if config.is_null() {
         serde_json::json!({})
     } else {
         config.clone()
     };
-    let source = sqlx::query_as(
+    secrets::seal_json_keys(&mut config, SOURCE_SECRET_KEYS);
+    let full_content = rss_full_content_enabled(kind, &config)?;
+    let source_id = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
+    let source: Source = sqlx::query_as(
         "INSERT INTO sources (id, kb_id, kind, name, config, icon, sync_interval_minutes, sync_cron)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
     )
-    .bind(Uuid::now_v7())
+    .bind(source_id)
     .bind(kb_id)
     .bind(kind)
     .bind(name.trim())
@@ -127,16 +210,20 @@ pub async fn create(
     .bind(icon)
     .bind(interval)
     .bind(cron_norm)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
-    Ok(source)
+    if full_content {
+        crate::rss_full_content::initialize_source(&mut tx, source.id).await?;
+    }
+    tx.commit().await?;
+    opened(source)
 }
 
 /// 设置 api 来源的推送密钥（创建 / 轮换时）。
 pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> AppResult<()> {
     let res = sqlx::query("UPDATE sources SET ingest_token = $2 WHERE id = $1")
         .bind(source_id)
-        .bind(token)
+        .bind(secrets::seal(token))
         .execute(pool)
         .await?;
     if res.rows_affected() == 0 {
@@ -146,6 +233,14 @@ pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> Ap
 }
 
 /// 更新调度：interval 与 cron 互斥，任一被显式设置时都会覆盖两者。
+fn rss_feed_url(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get("feed_url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     pool: &PgPool,
@@ -163,6 +258,29 @@ pub async fn update(
         }
         None => None,
     };
+
+    let mut tx = pool.begin().await?;
+    let previous: Source = sqlx::query_as("SELECT * FROM sources WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let mut next_config = config
+        .map(|value| {
+            if value.is_null() {
+                serde_json::json!({})
+            } else {
+                value.clone()
+            }
+        })
+        .unwrap_or_else(|| previous.config.clone());
+    secrets::seal_json_keys(&mut next_config, SOURCE_SECRET_KEYS);
+    let old_full = rss_full_content_enabled(&previous.kind, &previous.config)?;
+    let new_full = rss_full_content_enabled(&previous.kind, &next_config)?;
+    let feed_url_changed = previous.kind == "rss"
+        && old_full
+        && new_full
+        && rss_feed_url(&previous.config) != rss_feed_url(&next_config);
     let source = sqlx::query_as(
         "UPDATE sources SET
             name = COALESCE($2, name),
@@ -174,15 +292,19 @@ pub async fn update(
     )
     .bind(id)
     .bind(name)
-    .bind(config)
+    .bind(Some(next_config))
     .bind(icon)
     .bind(schedule.is_some())
     .bind(schedule.as_ref().and_then(|(i, _)| *i))
     .bind(schedule.as_ref().and_then(|(_, c)| c.clone()))
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
-    Ok(source)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if (!old_full && new_full) || feed_url_changed {
+        crate::rss_full_content::enable_source(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+    opened(source)
 }
 
 /// 删除来源；其文档保留（source_id 置 NULL，落回 Uploads 组）。
@@ -212,6 +334,10 @@ pub async fn due_sources(pool: &PgPool) -> AppResult<Vec<Source>> {
     .await?;
 
     let now = chrono::Utc::now();
+    let rows = rows
+        .into_iter()
+        .map(opened)
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(rows
         .into_iter()
         .filter(|s| match &s.sync_cron {
@@ -292,49 +418,6 @@ pub async fn finish_sync(
     Ok(true)
 }
 
-/// 文档打标签（整组替换）。
-///
-/// **零调用，故意留着**：没有路由，界面上也没有入口。标签会是文档上唯一
-/// 「人自己贴的」维度——来源是它从哪来的，名字与状态是系统给的，三者都表达
-/// 不了「这批要脱敏」这种横跨来源、只有人知道的分组。要不要有这个维度，
-/// 悬而未决——完整的两面之辞写在 `migrations/0002_ingest.sql` 的 `tags` 列上，
-/// 别当死代码删掉。
-pub async fn set_document_tags(
-    pool: &PgPool,
-    kb_id: Uuid,
-    document_id: Uuid,
-    tags: &[String],
-) -> AppResult<()> {
-    let cleaned: Vec<String> = tags
-        .iter()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let res = sqlx::query(
-        "UPDATE documents SET tags = $3, updated_at = now() WHERE id = $1 AND kb_id = $2",
-    )
-    .bind(document_id)
-    .bind(kb_id)
-    .bind(&cleaned)
-    .execute(pool)
-    .await?;
-    if res.rows_affected() == 0 {
-        return Err(AppError::NotFound);
-    }
-    Ok(())
-}
-
-/// 同步用去重：该 KB 是否已有同内容文档。
-pub async fn document_exists_by_sha(pool: &PgPool, kb_id: Uuid, sha256: &str) -> AppResult<bool> {
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM documents WHERE kb_id = $1 AND sha256 = $2 LIMIT 1")
-            .bind(kb_id)
-            .bind(sha256)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.is_some())
-}
-
 /// 记录同步时刻（避免调度器在长同步过程中重复触发后又立刻到期）。
 pub async fn touch_sync_time(pool: &PgPool, id: Uuid, at: DateTime<Utc>) -> AppResult<()> {
     sqlx::query("UPDATE sources SET last_sync_at = $2 WHERE id = $1")
@@ -348,6 +431,20 @@ pub async fn touch_sync_time(pool: &PgPool, id: Uuid, at: DateTime<Utc>) -> AppR
 // ---------------------------------------------------------------------------
 // 同步运行记录（渠道审计历史）
 // ---------------------------------------------------------------------------
+
+/// 调度时钟包含失败尝试，不能作增量游标。回到上次成功运行的开始，
+/// 让那次拉取期间发生的更新也能在下一轮读到；没有成功记录就重新全量读取。
+pub async fn last_successful_sync_start(
+    pool: &PgPool,
+    source_id: Uuid,
+) -> AppResult<Option<DateTime<Utc>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT max(started_at) FROM source_sync_runs WHERE source_id = $1 AND status = 'ok'",
+    )
+    .bind(source_id)
+    .fetch_one(pool)
+    .await?)
+}
 
 pub async fn start_run(pool: &PgPool, source_id: Uuid) -> AppResult<Uuid> {
     let id = Uuid::now_v7();
@@ -426,5 +523,27 @@ mod tests {
         let next = cron_next_after("*/5 * * * *", after).unwrap();
         assert!(next > after);
         assert!((next - after).num_minutes() <= 5);
+    }
+
+    #[test]
+    fn rss_content_mode_defaults_and_validates() {
+        assert_eq!(rss_content_mode(&serde_json::json!({})).unwrap(), "feed");
+        assert_eq!(
+            rss_content_mode(&serde_json::json!({ "content_mode": "feed" })).unwrap(),
+            "feed"
+        );
+        assert_eq!(
+            rss_content_mode(&serde_json::json!({ "content_mode": "full_new_items" })).unwrap(),
+            "full_new_items"
+        );
+        assert!(rss_content_mode(&serde_json::json!({ "content_mode": "all" })).is_err());
+        assert!(rss_content_mode(&serde_json::json!({ "content_mode": true })).is_err());
+        assert!(!rss_full_content_enabled(
+            "url",
+            &serde_json::json!({
+                "content_mode": "full_new_items"
+            })
+        )
+        .unwrap());
     }
 }

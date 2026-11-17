@@ -27,15 +27,25 @@ pub struct AppState {
     /// 原始文件字节的存取接缝（内容寻址，key = sha256）；当前实现为本地磁盘
     pub blob: Arc<dyn crate::blob::BlobStore>,
     pub open_registration: bool,
+    pub password_login: bool,
     /// 强制 Secure cookie（配置项）；未强制时按请求的 X-Forwarded-Proto 逐次判定
     pub cookie_secure: bool,
+    /// 分块预算，见 `AppConfig::chunk_tokens`
+    pub chunk_tokens: usize,
+    /// 见 `AppConfig::extract_known_in_prompt`
+    pub extract_known_in_prompt: bool,
     /// worker 并发数：调度循环每轮热读——系统设置改动即时生效
     pub worker_concurrency: Arc<std::sync::atomic::AtomicUsize>,
+    /// 各工作区的对话客户端。端点报过的上下文窗口记在客户端上，留着它下一轮才记得（#964）
+    pub chat_clients: Arc<crate::llm_util::ConversationClients>,
     /// 按模型的并发闸门：后台任务调 LLM 前取许可。限额存库，改完即时生效
     pub model_gates: Arc<crate::llm_util::ModelGates>,
     pub events: broadcast::Sender<AppEvent>,
     /// 正在生成的回答，按会话查。**刷新页面之后还能接上**（见 `live`）
     pub live: Arc<crate::live::Registry>,
+    /// 表的 owner 的连接串：迁移身份与运行身份分开时才有（`UTOPIA_MIGRATION_URL`）。
+    /// 运行期只有建向量索引用它，用完即关（`vector_index::build_as_owner`，#1120）
+    pub owner_database_url: Option<String>,
 }
 
 impl AppState {
@@ -57,11 +67,20 @@ impl AppState {
             docs: Arc::new(crate::docs_corpus::build_index()),
             blob,
             open_registration: cfg.open_registration,
+            password_login: cfg.password_login,
             cookie_secure: cfg.cookie_secure,
-            worker_concurrency: Arc::new(std::sync::atomic::AtomicUsize::new(32)),
+            chunk_tokens: cfg.chunk_tokens,
+            extract_known_in_prompt: cfg.extract_known_in_prompt,
+            // 与 `deployment_settings.worker_concurrency` 的列缺省保持一致（迁移 0011）：
+            // access::worker_concurrency 的「行不存在」兜底是 64，main.rs 的「函数本身
+            // 报错」兜底也是 64——这是**服务起来后第一次读这个值之前**的值，写错了
+            // 就意味着服务启动那一小会儿跑的是迁移 0011 想避免的并发不足。
+            worker_concurrency: Arc::new(std::sync::atomic::AtomicUsize::new(64)),
+            chat_clients: Arc::new(crate::llm_util::ConversationClients::default()),
             model_gates: Arc::new(crate::llm_util::ModelGates::default()),
             events,
             live: Arc::new(crate::live::Registry::default()),
+            owner_database_url: cfg.migration_url.clone(),
         }
     }
 
@@ -78,6 +97,16 @@ impl AppState {
         let _ = self.events.send(AppEvent {
             kb_id: Some(kb_id),
             kind: "review",
+            document_id: None,
+        });
+    }
+
+    /// 一句记忆抽出了等人点头的事实（0015）。对话里那张确认卡按这个刷新——
+    /// 抽取是异步的，卡片只能在任务完成时长出来，而不是在助手回话的那一刻
+    pub fn emit_pending(&self, kb_id: Uuid) {
+        let _ = self.events.send(AppEvent {
+            kb_id: Some(kb_id),
+            kind: "pending",
             document_id: None,
         });
     }

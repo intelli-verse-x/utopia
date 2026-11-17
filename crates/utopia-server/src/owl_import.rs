@@ -27,6 +27,11 @@ pub enum Disposition {
     /// key 被另一个 IRI 占着，但对齐表说那两个是**同一个东西** → 跳过且不算冲突。
     /// 与 KeyTaken 分开，是因为它不需要人裁：少建一个重复的类正是想要的结果
     Aligned,
+    /// 词表自己说这条属性已被另一条取代（`schema:supersededBy`），而取代它的那条
+    /// 在这个文件里或库里 → 不建。建了就是两个 key 指同一个关系：抽取的精确 key
+    /// 命中让 `employees` 与 `employee` 永久分家，屈折归一根本没机会开口（#560）。
+    /// 不建之后，模型说 `employees` 会折到 `employee` 上
+    Superseded,
 }
 
 /// 一个属性在这次导入里会不会被建出来，以及为什么。
@@ -141,6 +146,10 @@ impl ImportPlan {
         for a in &self.attributes {
             if a.disposition == Disposition::KeyTaken {
                 *out.entry("key_taken").or_default() += 1;
+                continue;
+            }
+            if a.disposition == Disposition::Superseded {
+                *out.entry("superseded").or_default() += 1;
                 continue;
             }
             let reason = match a.attr.as_ref() {
@@ -272,8 +281,17 @@ pub async fn plan(
 
     let mut relations = Vec::new();
     let mut attributes = Vec::new();
+    // 让位的属性只在取代它的那条**能落地**时才跳过：取代者在这个文件里，或库里已有。
+    // 取代者不在场时照建——否则一份只带了让位方的小词表会一条都建不出来
+    let prop_iris: HashSet<&str> = proj.properties.iter().map(|p| p.iri.as_str()).collect();
     for p in &proj.properties {
-        let (disposition, conflict_with) = if let Some(prev) = claimed_prop.get(p.key.as_str()) {
+        let successor = p
+            .superseded_by
+            .as_deref()
+            .filter(|s| prop_iris.contains(s) || r_by_iri.contains_key(s));
+        let (disposition, conflict_with) = if let Some(s) = successor {
+            (Disposition::Superseded, Some(s.to_string()))
+        } else if let Some(prev) = claimed_prop.get(p.key.as_str()) {
             (Disposition::KeyTaken, Some((*prev).to_string()))
         } else if r_by_iri.contains_key(p.iri.as_str()) {
             (Disposition::Update, None)
@@ -282,7 +300,7 @@ pub async fn plan(
         } else {
             (Disposition::Create, None)
         };
-        if disposition != Disposition::KeyTaken {
+        if !matches!(disposition, Disposition::KeyTaken | Disposition::Superseded) {
             claimed_prop.insert(p.key.as_str(), p.iri.as_str());
         }
         let mut item = PlannedItem {
@@ -323,12 +341,73 @@ pub async fn plan(
     Ok((plan, proj, format))
 }
 
+/// 装完一组包之后再过一遍：把 domain / range 指向**别的包里的类**的那些关系接上。
+///
+/// 单次导入认本文件里的类和库里已有的类（见 [`apply`] 里的 resolve），但包是挨个
+/// 装的：装 W3C Org 时 FOAF 还没来，`headOf` 的 `rdfs:domain foaf:Agent` 就落了空；
+/// 等 FOAF 装好，没人回头补。没有 domain 的谓词判不出方向，
+/// 反向的 `Project Aurora head_of Li Ting` 就原样进图（#222）。
+///
+/// 只补不删，关联表 ON CONFLICT DO NOTHING，重复跑无害。属性不在这里：属性的
+/// 去向在计划阶段就定了（没有 domain 的根本建不出来），事后补 domain 改不了它
+/// 已经是不是一列的事实
+pub async fn relink_domains_ranges(
+    state: &AppState,
+    kb_id: Uuid,
+    filename: &str,
+    bytes: &[u8],
+) -> AppResult<(usize, usize)> {
+    let format = RdfFormat::detect(filename, bytes);
+    let proj = ontology_rdf::project(bytes, format).map_err(|e| {
+        utopia_core::AppError::invalid_detail(
+            "bad_ontology_file",
+            "Could not parse this ontology file",
+            e.to_string(),
+        )
+    })?;
+    let classes: HashMap<String, Uuid> = utopia_store::graph::entity_types(&state.pool, kb_id)
+        .await?
+        .into_iter()
+        .filter_map(|t| t.iri.clone().map(|i| (i, t.id)))
+        .collect();
+    let relations: HashMap<String, Uuid> = utopia_store::graph::relation_types(&state.pool, kb_id)
+        .await?
+        .into_iter()
+        .filter_map(|r| r.iri.clone().map(|i| (i, r.id)))
+        .collect();
+    let mut link_d: Vec<(Uuid, Uuid)> = Vec::new();
+    let mut link_r: Vec<(Uuid, Uuid)> = Vec::new();
+    for p in &proj.properties {
+        if p.is_datatype {
+            continue;
+        }
+        let Some(&rid) = relations.get(&p.iri) else {
+            continue;
+        };
+        link_d.extend(
+            p.domains
+                .iter()
+                .filter_map(|d| classes.get(d).map(|&t| (rid, t))),
+        );
+        link_r.extend(
+            p.ranges
+                .iter()
+                .filter_map(|r| classes.get(r).map(|&t| (rid, t))),
+        );
+    }
+    utopia_store::ontology::link_domains_ranges_bulk(&state.pool, &link_d, &link_r).await?;
+    Ok((link_d.len(), link_r.len()))
+}
+
 /// 执行计划。属性在类之后落库——它们要挂在 domain 上，而 domain 要等
 /// 类先建好并解析 IRI → id（就是下面那个 `id_of`）。
+///
+/// `via_token`：代 `actor` 导入的那枚令牌，只进审计行（0014 决定 6）；会话是 None
 pub async fn apply(
     state: &AppState,
     kb_id: Uuid,
     actor: Uuid,
+    via_token: Option<Uuid>,
     filename: &str,
     bytes: &[u8],
 ) -> AppResult<(Uuid, ImportPlan)> {
@@ -432,7 +511,8 @@ pub async fn apply(
                     }
                 }
             }
-            Disposition::KeyTaken => {}
+            // 类没有让位一说（schema:supersededBy 只标属性），穷举是为了编译器替我们看着
+            Disposition::KeyTaken | Disposition::Superseded => {}
         }
     }
 
@@ -493,16 +573,30 @@ pub async fn apply(
     // (key, domains, ranges)：关系 id 要等批量插完才有，先按 key 记着
     let mut pending_links: Vec<(String, Vec<Uuid>, Vec<Uuid>)> = Vec::new();
     for item in &plan.relations {
-        if item.disposition == Disposition::KeyTaken {
+        if matches!(
+            item.disposition,
+            Disposition::KeyTaken | Disposition::Superseded
+        ) {
             continue;
         }
         let Some(p) = by_prop_iri.get(item.iri.as_str()) else {
             continue;
         };
         // domain/range 指向没被建出来的类时只丢那一个，不丢整条关系：
-        // 关系不像属性那样必须挂在类上，没有 domain 就是"不限主语类型"
+        // 关系不像属性那样必须挂在类上，没有 domain 就是"不限主语类型"。
+        //
+        // **库里已有的类也算数。** 从前只认本文件里的类，于是 W3C Org 的
+        // `headOf rdfs:domain foaf:Agent` 在 FOAF 已经装好的库里照样丢 domain，
+        // 而没有 domain 的谓词根本判不出方向（#222）
         let resolve = |iris: &[String]| -> Vec<Uuid> {
-            iris.iter().filter_map(|i| id_of.get(i).copied()).collect()
+            iris.iter()
+                .filter_map(|i| {
+                    id_of
+                        .get(i)
+                        .copied()
+                        .or_else(|| existing_by_iri.get(i).copied())
+                })
+                .collect()
         };
         let domains = resolve(&p.domains);
         let ranges = resolve(&p.ranges);
@@ -516,6 +610,7 @@ pub async fn apply(
                 &p.description,
                 &domains,
                 &ranges,
+                p.temporal.as_deref(),
             )
             .await?
             {
@@ -537,6 +632,8 @@ pub async fn apply(
             symmetric: p.symmetric,
             asymmetric: p.asymmetric,
             irreflexive: p.irreflexive,
+            // 本体用 `utopia:temporal` 说了的照它说的（0031）；没说的是 state
+            temporal: p.temporal.as_deref().unwrap_or("state").to_string(),
         });
         pending_links.push((p.key.clone(), domains, ranges));
     }
@@ -588,7 +685,10 @@ pub async fn apply(
     let mut new_attrs: Vec<utopia_store::ontology::BulkRelation> = Vec::new();
     let mut pending_attr_domains: Vec<(String, Vec<Uuid>)> = Vec::new();
     for item in &plan.attributes {
-        if item.disposition == Disposition::KeyTaken {
+        if matches!(
+            item.disposition,
+            Disposition::KeyTaken | Disposition::Superseded
+        ) {
             continue;
         }
         let (Some(note), Some(p)) = (item.attr.as_ref(), by_prop_iri.get(item.iri.as_str())) else {
@@ -622,6 +722,8 @@ pub async fn apply(
             symmetric: false,
             asymmetric: false,
             irreflexive: false,
+            // 属性建成 state，页面也不给别的选（0031 的「未决」里那一条）
+            temporal: "state".to_string(),
         });
         pending_attr_domains.push((p.key.clone(), domain_ids));
     }
@@ -647,6 +749,8 @@ pub async fn apply(
         "inverse_linked": linked_inv,
         "sub_property_linked": linked_sub,
         "relations_created": created_rels,
+        // 词表自己让位的那些：不建，也不算冲突
+        "relations_superseded": plan.relations.iter().filter(|r| r.disposition == Disposition::Superseded).count(),
         "relations_updated": updated_rels,
         "attributes_seen": plan.attributes.len(),
         "attributes_created": created_attrs,
@@ -675,7 +779,7 @@ pub async fn apply(
         "ontology.imported",
         "kb",
         Some(kb_id),
-        summary,
+        utopia_store::audit::via_token(summary, via_token),
     )
     .await;
     // 本体刚变过，向量都是陈的。**排任务而不是就地跑**：这一趟要嵌几千行，
